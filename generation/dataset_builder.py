@@ -27,12 +27,17 @@ from dataclasses import dataclass, asdict
 import itertools
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import torch
 
 # Import generators from previous steps
 from generation.drive_cycles import DriveCycleLoader
 from generation.temperature_profiles import TemperatureProfileGenerator
 from generation.batch_simulator import BatchPhysicsSimulator, SimulationConfig
 from generation.sensor_noise import SensorNoiseInjector, NoiseConfig
+from generation.gpu_batch_simulator import gpu_simulate_all_scenarios, GPUSimConfig
+
+_USE_GPU = torch.cuda.is_available()
+print(f"[DatasetBuilder] GPU available: {_USE_GPU}")
 
 
 @dataclass
@@ -299,30 +304,38 @@ def _simulate_scenario_worker(args):
         np.random.shuffle(scenarios)
         
         # ================================================================
-        # Parallel simulation using all available CPU cores
+        # Simulation: GPU (all at once) or CPU (multiprocessing fallback)
         # ================================================================
-        n_cpus = max(1, os.cpu_count() - 1)  # Leave 1 core free
-        print(f"\nSimulating {len(scenarios)} scenarios using {n_cpus} parallel workers...")
-        
-        config_dict = {'add_noise': self.config.add_noise}
-        args_list = [(scenario, config_dict, i) for i, scenario in enumerate(scenarios)]
-        
-        all_data_dict = {}
-        with ProcessPoolExecutor(max_workers=n_cpus) as executor:
-            futures = {executor.submit(_simulate_scenario_worker, args): args[2] for args in args_list}
-            completed = 0
-            for future in as_completed(futures):
-                i, df = future.result()
-                completed += 1
-                if df is not None:
-                    all_data_dict[i] = df
-                    print(f"  [{completed}/{len(scenarios)}] ✓ Scenario {i} done", end='\r')
-                else:
-                    print(f"  [{completed}/{len(scenarios)}] ✗ Scenario {i} failed", end='\r')
-        
-        # Re-order by original scenario index
-        all_data = [all_data_dict[k] for k in sorted(all_data_dict.keys())]
-        print(f"\n\n✓ Parallel simulation complete: {len(all_data)}/{len(scenarios)} scenarios succeeded.")
+        if _USE_GPU:
+            print(f"\n⚡ GPU detected — running {len(scenarios)} scenarios in parallel on GPU...")
+            all_data = gpu_simulate_all_scenarios(
+                scenarios=scenarios,
+                drive_loader=self.drive_loader,
+                temp_gen=self.temp_gen,
+                noise_injector=self.noise_injector if self.config.add_noise else None,
+                add_noise=self.config.add_noise,
+                cfg=GPUSimConfig(),
+                chunk_size=200,   # tune based on GPU VRAM (100-400 typical)
+            )
+            # Set scenario IDs
+            for i, df in enumerate(all_data):
+                df['scenario_id'] = i
+        else:
+            print(f"\n🖥  No GPU — running {len(scenarios)} scenarios with {max(1, os.cpu_count()-1)} CPU workers...")
+            config_dict = {'add_noise': self.config.add_noise}
+            args_list = [(scenario, config_dict, i) for i, scenario in enumerate(scenarios)]
+            all_data_dict = {}
+            with ProcessPoolExecutor(max_workers=max(1, os.cpu_count()-1)) as executor:
+                futures = {executor.submit(_simulate_scenario_worker, args): args[2] for args in args_list}
+                completed = 0
+                for future in as_completed(futures):
+                    i, df = future.result()
+                    completed += 1
+                    if df is not None:
+                        all_data_dict[i] = df
+                    print(f"  [{completed}/{len(scenarios)}] done", end='\r')
+            all_data = [all_data_dict[k] for k in sorted(all_data_dict.keys())]
+            print(f"\n✓ CPU simulation complete: {len(all_data)}/{len(scenarios)} scenarios")
 
         print()  # New line after progress
         
