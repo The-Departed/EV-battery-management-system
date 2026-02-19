@@ -468,14 +468,21 @@ def main():
     # ========================================================================
     config = DatasetConfig(
         # Scenario coverage
-        drive_cycles=['UDDS', 'US06', 'HWFET'],
+        # Repeat cycles to get random variations (stochastic generation)
+        drive_cycles=['UDDS']*5 + ['US06']*5 + ['HWFET']*5,  
         temp_profiles=[
-            ('constant', 0, 0),      # Cold: 0°C
-            ('constant', 25, 0),     # Nominal: 25°C
-            ('constant', 50, 0),     # Hot: 50°C
+            ('constant', -10, 0),    # Extreme Cold
+            ('constant', 0, 0),      # Cold
+            ('constant', 10, 0),     # Cool
+            ('constant', 25, 0),     # Nominal
+            ('constant', 40, 0),     # Warm
+            ('constant', 50, 0),     # Hot
+            ('constant', 60, 0),     # Extreme Hot
             ('sinusoidal', 25, 10),  # Daily cycle: 25±10°C
+            ('sinusoidal', 10, 10),  # Cold Daily: 10±10°C
+            ('sinusoidal', 40, 10),  # Hot Daily: 40±10°C
         ],
-        soc_initial_range=[0.5, 0.7, 0.9, 1.0],
+        soc_initial_range=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
         
         # Split ratios
         train_ratio=0.7,

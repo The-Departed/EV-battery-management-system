@@ -51,4 +51,26 @@ uv sync
 ## Current Status
 
 ✅ Project structure created
-🔄 Phase 1, Step 1.1: Data Loader (in progress)
+✅ Phase 1: ECM System Identification (Completed)
+✅ Phase 2: Heat Generation Model (Completed)
+✅ Phase 3: EETM Thermal Model (Completed)
+🔄 Phase 4: Transformer Temperature Prediction (In Progress)
+
+## Quick Start (Phase 4 Automation)
+
+To run the full pipeline (Data Generation -> Model Training):
+
+```bash
+# 1. Generate Synthetic Data (100+ Hours, 400+ Scenarios)
+python run_all.py --step generate
+
+# 2. Train Transformer Model (GPU Enabled)
+python run_all.py --step train --epochs 10
+
+# OR Run Everything at Once:
+python run_all.py --step all
+```
+
+### Outputs
+- **Datasets**: `results/datasets/` (Train/Val/Test CSVs + Visualization Plots)
+- **Model Results**: `results/model/` (Predictions CSV + Paper-Replication Plots)
