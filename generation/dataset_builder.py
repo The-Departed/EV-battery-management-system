@@ -25,6 +25,8 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass, asdict
 import itertools
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Import generators from previous steps
 from generation.drive_cycles import DriveCycleLoader
@@ -222,7 +224,60 @@ class DatasetBuilder:
             df['temp_ambient_meas_C'] = noisy_data['temp_ambient_noisy']
             df['power_meas_W'] = noisy_data['power_noisy']
         
+        print(f"\n  ✓ Scenario {i+1} complete: {scenario['drive_cycle']} @ {scenario['temp_param1']}°C")
         return df
+
+
+def _simulate_scenario_worker(args):
+    """
+    Top-level worker function for parallel scenario simulation.
+    Must be top-level (not a method) so multiprocessing can pickle it.
+    """
+    scenario, config_dict, i = args
+    # Reconstruct config and builder inside the worker process
+    from generation.batch_simulator import BatchPhysicsSimulator, SimulationConfig
+    from generation.drive_cycles import DriveCycleLoader
+    from generation.temperature_profiles import TemperatureProfileGenerator
+    from generation.sensor_noise import SensorNoiseInjector, NoiseConfig
+
+    drive_loader = DriveCycleLoader()
+    temp_gen = TemperatureProfileGenerator()
+    simulator = BatchPhysicsSimulator(SimulationConfig())
+    noise_injector = SensorNoiseInjector(NoiseConfig())
+    add_noise = config_dict.get('add_noise', True)
+
+    try:
+        time, current = drive_loader.load_cycle(scenario['drive_cycle'])
+        if scenario['temp_type'] == 'constant':
+            _, temp_k = temp_gen.generate_constant(duration=time[-1], temperature_c=scenario['temp_param1'])
+        elif scenario['temp_type'] == 'sinusoidal':
+            _, temp_k = temp_gen.generate_sinusoidal(duration=time[-1], temp_mean_c=scenario['temp_param1'], temp_amplitude_c=scenario['temp_param2'], period=time[-1])
+
+        results = simulator.simulate(time=time, current=current, temp_ambient_k=temp_k, soc_initial=scenario['soc_initial'])
+
+        C_TO_K = 273.15
+        df = pd.DataFrame({
+            'time_s': results['time'], 'current_A': results['current'], 'voltage_V': results['voltage'],
+            'soc': results['soc'], 'temp_surface_C': results['temp_surface_k'] - C_TO_K,
+            'temp_core_C': results['temp_core_k'] - C_TO_K, 'temp_ambient_C': results['temp_ambient_k'] - C_TO_K,
+            'heat_generation_W': results['heat_generation'], 'power_W': results['power']
+        })
+        for key, value in scenario.items():
+            df[f'meta_{key}'] = value
+        if add_noise:
+            clean_data = {'current': df['current_A'].values, 'voltage': df['voltage_V'].values,
+                          'temp_surface': df['temp_surface_C'].values, 'temp_ambient': df['temp_ambient_C'].values}
+            noisy_data = noise_injector.inject_dataset_noise(clean_data)
+            df['current_meas_A'] = noisy_data['current_noisy']
+            df['voltage_meas_V'] = noisy_data['voltage_noisy']
+            df['temp_surface_meas_C'] = noisy_data['temp_surface_noisy']
+            df['temp_ambient_meas_C'] = noisy_data['temp_ambient_noisy']
+            df['power_meas_W'] = noisy_data['power_noisy']
+        df['scenario_id'] = i
+        return i, df
+    except Exception as e:
+        return i, None
+
     
     def generate_dataset(self) -> Dict[str, pd.DataFrame]:
         """
@@ -243,21 +298,32 @@ class DatasetBuilder:
         # Shuffle scenarios for random train/val/test split
         np.random.shuffle(scenarios)
         
-        # Simulate all scenarios
-        print(f"\nSimulating {len(scenarios)} scenarios...")
-        all_data = []
+        # ================================================================
+        # Parallel simulation using all available CPU cores
+        # ================================================================
+        n_cpus = max(1, os.cpu_count() - 1)  # Leave 1 core free
+        print(f"\nSimulating {len(scenarios)} scenarios using {n_cpus} parallel workers...")
         
-        for i, scenario in enumerate(scenarios):
-            print(f"  [{i+1}/{len(scenarios)}] Simulating: {scenario['drive_cycle']} @ "
-                  f"{scenario['temp_param1']}°C, SOC={scenario['soc_initial']:.1%}", end='\r')
-            try:
-                df = self.simulate_scenario(scenario)
-                df['scenario_id'] = i
-                all_data.append(df)
-            except Exception as e:
-                print(f"\n  Warning: Scenario {i} failed: {e}")
-                continue
+        config_dict = {'add_noise': self.config.add_noise}
+        args_list = [(scenario, config_dict, i) for i, scenario in enumerate(scenarios)]
         
+        all_data_dict = {}
+        with ProcessPoolExecutor(max_workers=n_cpus) as executor:
+            futures = {executor.submit(_simulate_scenario_worker, args): args[2] for args in args_list}
+            completed = 0
+            for future in as_completed(futures):
+                i, df = future.result()
+                completed += 1
+                if df is not None:
+                    all_data_dict[i] = df
+                    print(f"  [{completed}/{len(scenarios)}] ✓ Scenario {i} done", end='\r')
+                else:
+                    print(f"  [{completed}/{len(scenarios)}] ✗ Scenario {i} failed", end='\r')
+        
+        # Re-order by original scenario index
+        all_data = [all_data_dict[k] for k in sorted(all_data_dict.keys())]
+        print(f"\n\n✓ Parallel simulation complete: {len(all_data)}/{len(scenarios)} scenarios succeeded.")
+
         print()  # New line after progress
         
         # Concatenate all scenarios
