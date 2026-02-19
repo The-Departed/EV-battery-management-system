@@ -1,0 +1,36 @@
+================================================================================
+DATASET VALIDATION REPORT
+================================================================================
+
+Dataset: battery_thermal_v1
+Generated: 2026-01-27
+
+DATASET SIZE:
+  Train: 30,678 samples
+  Val:   6,233 samples
+  Test:  6,833 samples
+  Total: 43,744 samples
+
+FEATURE RANGES (from training set):
+  current_A                : [ -5.9622,   2.9794]
+  voltage_V                : [  3.4095,   4.0550]
+  temp_surface_C           : [  4.0067,  47.0037]
+  temp_ambient_C           : [  0.0000,  50.0000]
+  soc                      : [  0.3480,   1.0000]
+  temp_core_C              : [  4.6000,  46.6153]
+  current_meas_A           : [ -5.9580,   2.9920]
+  voltage_meas_V           : [  3.4070,   4.0550]
+  temp_surface_meas_C      : [  3.9100,  47.1500]
+  temp_ambient_meas_C      : [ -0.4100,  50.3900]
+
+================================================================================
+VALIDATION SUMMARY
+================================================================================
+
+✓ Data quality checks PASSED
+✓ Physical consistency validated
+✓ Feature correlations expected
+✓ Operating envelope coverage comprehensive
+✓ Sample trajectories physically realistic
+
+Dataset is READY for ML training (Phase 4)

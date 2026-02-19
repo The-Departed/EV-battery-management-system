@@ -1,0 +1,57 @@
+{
+  "drive_cycles": [
+    "UDDS",
+    "US06",
+    "HWFET"
+  ],
+  "temp_profiles": [
+    [
+      "constant",
+      0,
+      0
+    ],
+    [
+      "constant",
+      25,
+      0
+    ],
+    [
+      "constant",
+      50,
+      0
+    ],
+    [
+      "sinusoidal",
+      25,
+      10
+    ]
+  ],
+  "soc_initial_range": [
+    0.5,
+    0.7,
+    0.9,
+    1.0
+  ],
+  "train_ratio": 0.7,
+  "val_ratio": 0.15,
+  "test_ratio": 0.15,
+  "add_noise": true,
+  "noise_config": {
+    "current_noise_std": 0.01,
+    "voltage_noise_std": 0.002,
+    "temp_noise_std": 0.1,
+    "current_resolution": 0.001,
+    "voltage_resolution": 0.001,
+    "temp_resolution": 0.01,
+    "current_bias": 0.0,
+    "voltage_bias": 0.0,
+    "temp_bias": 0.0,
+    "outlier_probability": 0.001,
+    "outlier_magnitude": 3.0,
+    "random_seed": 42
+  },
+  "output_dir": "results/datasets",
+  "dataset_name": "battery_thermal_v1",
+  "save_format": "csv",
+  "random_seed": 42
+}
