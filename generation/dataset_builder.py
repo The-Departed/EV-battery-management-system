@@ -231,6 +231,143 @@ class DatasetBuilder:
         
         print(f"\n  ✓ Scenario {i+1} complete: {scenario['drive_cycle']} @ {scenario['temp_param1']}°C")
         return df
+    
+    def generate_dataset(self) -> Dict[str, pd.DataFrame]:
+        """Generate full dataset with all scenarios."""
+        print("\n" + "="*80)
+        print("GENERATING FULL DATASET")
+        print("="*80 + "\n")
+        
+        scenarios = self.generate_scenario_list()
+        np.random.shuffle(scenarios)
+        
+        if _USE_GPU:
+            print(f"\n⚡ GPU detected — running {len(scenarios)} scenarios in parallel on GPU...")
+            all_data = gpu_simulate_all_scenarios(
+                scenarios=scenarios,
+                drive_loader=self.drive_loader,
+                temp_gen=self.temp_gen,
+                noise_injector=self.noise_injector if self.config.add_noise else None,
+                add_noise=self.config.add_noise,
+                cfg=GPUSimConfig(),
+                chunk_size=200,
+            )
+            for i, df in enumerate(all_data):
+                df['scenario_id'] = i
+        else:
+            print(f"\n🖥  No GPU — running {len(scenarios)} scenarios with {max(1, os.cpu_count()-1)} CPU workers...")
+            config_dict = {'add_noise': self.config.add_noise}
+            args_list = [(scenario, config_dict, i) for i, scenario in enumerate(scenarios)]
+            all_data_dict = {}
+            with ProcessPoolExecutor(max_workers=max(1, os.cpu_count()-1)) as executor:
+                futures = {executor.submit(_simulate_scenario_worker, args): args[2] for args in args_list}
+                completed = 0
+                for future in as_completed(futures):
+                    i, df = future.result()
+                    completed += 1
+                    if df is not None:
+                        all_data_dict[i] = df
+                    print(f"  [{completed}/{len(scenarios)}] done", end='\r')
+            all_data = [all_data_dict[k] for k in sorted(all_data_dict.keys())]
+            print(f"\n✓ CPU simulation complete: {len(all_data)}/{len(scenarios)} scenarios")
+
+        print()
+        full_df = pd.concat(all_data, ignore_index=True)
+        print(f"\n✓ Generated {len(full_df)} total samples from {len(all_data)} scenarios")
+        
+        n_scenarios = len(all_data)
+        n_train = int(n_scenarios * self.config.train_ratio)
+        n_val = int(n_scenarios * self.config.val_ratio)
+        
+        train_scenarios = list(range(n_train))
+        val_scenarios = list(range(n_train, n_train + n_val))
+        test_scenarios = list(range(n_train + n_val, n_scenarios))
+        
+        dataset = {
+            'train': full_df[full_df['scenario_id'].isin(train_scenarios)].reset_index(drop=True),
+            'val': full_df[full_df['scenario_id'].isin(val_scenarios)].reset_index(drop=True),
+            'test': full_df[full_df['scenario_id'].isin(test_scenarios)].reset_index(drop=True)
+        }
+        
+        print(f"\n✓ Dataset split:")
+        print(f"  Train: {len(dataset['train'])} samples ({len(train_scenarios)} scenarios)")
+        print(f"  Val:   {len(dataset['val'])} samples ({len(val_scenarios)} scenarios)")
+        print(f"  Test:  {len(dataset['test'])} samples ({len(test_scenarios)} scenarios)")
+        
+        return dataset
+    
+    def compute_normalization_params(self, train_df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
+        """Compute normalization parameters from training set."""
+        features = ['current_A', 'voltage_V', 'temp_surface_C', 'temp_ambient_C', 'soc', 'temp_core_C']
+        if self.config.add_noise:
+            features += ['current_meas_A', 'voltage_meas_V', 'temp_surface_meas_C', 'temp_ambient_meas_C']
+        
+        norm_params = {}
+        for feature in features:
+            if feature in train_df.columns:
+                norm_params[feature] = {
+                    'mean': float(train_df[feature].mean()),
+                    'std': float(train_df[feature].std()),
+                    'min': float(train_df[feature].min()),
+                    'max': float(train_df[feature].max())
+                }
+        return norm_params
+    
+    def save_dataset(self, dataset: Dict[str, pd.DataFrame], norm_params: Dict[str, Dict[str, float]]):
+        """Save dataset to disk."""
+        print("\n" + "="*80)
+        print("SAVING DATASET")
+        print("="*80 + "\n")
+        
+        if self.config.save_format == 'csv':
+            for split_name, df in dataset.items():
+                csv_path = self.output_path / f"{self.config.dataset_name}_{split_name}.csv"
+                df.to_csv(csv_path, index=False)
+                print(f"✓ CSV saved: {csv_path} ({len(df)} samples)")
+            
+            norm_path = self.output_path / f"{self.config.dataset_name}_normalization.json"
+            with open(norm_path, 'w') as f:
+                json.dump(norm_params, f, indent=2)
+            print(f"✓ Normalization params saved: {norm_path}")
+            
+            config_path = self.output_path / f"{self.config.dataset_name}_config.json"
+            with open(config_path, 'w') as f:
+                json.dump(asdict(self.config), f, indent=2, default=str)
+            print(f"✓ Config saved: {config_path}")
+    
+    def plot_dataset_statistics(self, dataset: Dict[str, pd.DataFrame]):
+        """Plot dataset statistics and distributions."""
+        print("\n" + "="*80)
+        print("PLOTTING DATASET STATISTICS")
+        print("="*80 + "\n")
+        
+        fig, axes = plt.subplots(3, 3, figsize=(18, 12))
+        fig.suptitle('Dataset Statistics', fontsize=16, fontweight='bold')
+        
+        features = [
+            ('current_A', 'Current [A]'), ('voltage_V', 'Voltage [V]'), ('soc', 'SOC'),
+            ('temp_surface_C', 'Surface Temp [°C]'), ('temp_core_C', 'Core Temp [°C]'),
+            ('temp_ambient_C', 'Ambient Temp [°C]'), ('heat_generation_W', 'Heat Gen [W]'),
+            ('power_W', 'Power [W]')
+        ]
+        
+        for idx, (feature, label) in enumerate(features[:9]):
+            ax = axes[idx // 3, idx % 3]
+            for split_name, color in [('train', 'blue'), ('val', 'orange'), ('test', 'green')]:
+                if feature in dataset[split_name].columns:
+                    data = dataset[split_name][feature].values
+                    ax.hist(data, bins=50, alpha=0.5, label=split_name, color=color, density=True)
+            ax.set_xlabel(label, fontsize=10)
+            ax.set_ylabel('Density', fontsize=10)
+            ax.set_title(f'{label} Distribution', fontsize=11, fontweight='bold')
+            ax.legend(fontsize=9)
+            ax.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plot_path = self.output_path / f"{self.config.dataset_name}_statistics.png"
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        print(f"✓ Statistics plot saved: {plot_path}")
+        plt.close()
 
 
 def _simulate_scenario_worker(args):
@@ -282,257 +419,6 @@ def _simulate_scenario_worker(args):
         return i, df
     except Exception as e:
         return i, None
-
-    
-    def generate_dataset(self) -> Dict[str, pd.DataFrame]:
-        """
-        Generate full dataset with all scenarios.
-        
-        Returns
-        -------
-        dataset : dict
-            Dictionary with 'train', 'val', 'test' DataFrames
-        """
-        print("\n" + "="*80)
-        print("GENERATING FULL DATASET")
-        print("="*80 + "\n")
-        
-        # Generate scenario list
-        scenarios = self.generate_scenario_list()
-        
-        # Shuffle scenarios for random train/val/test split
-        np.random.shuffle(scenarios)
-        
-        # ================================================================
-        # Simulation: GPU (all at once) or CPU (multiprocessing fallback)
-        # ================================================================
-        if _USE_GPU:
-            print(f"\n⚡ GPU detected — running {len(scenarios)} scenarios in parallel on GPU...")
-            all_data = gpu_simulate_all_scenarios(
-                scenarios=scenarios,
-                drive_loader=self.drive_loader,
-                temp_gen=self.temp_gen,
-                noise_injector=self.noise_injector if self.config.add_noise else None,
-                add_noise=self.config.add_noise,
-                cfg=GPUSimConfig(),
-                chunk_size=200,   # tune based on GPU VRAM (100-400 typical)
-            )
-            # Set scenario IDs
-            for i, df in enumerate(all_data):
-                df['scenario_id'] = i
-        else:
-            print(f"\n🖥  No GPU — running {len(scenarios)} scenarios with {max(1, os.cpu_count()-1)} CPU workers...")
-            config_dict = {'add_noise': self.config.add_noise}
-            args_list = [(scenario, config_dict, i) for i, scenario in enumerate(scenarios)]
-            all_data_dict = {}
-            with ProcessPoolExecutor(max_workers=max(1, os.cpu_count()-1)) as executor:
-                futures = {executor.submit(_simulate_scenario_worker, args): args[2] for args in args_list}
-                completed = 0
-                for future in as_completed(futures):
-                    i, df = future.result()
-                    completed += 1
-                    if df is not None:
-                        all_data_dict[i] = df
-                    print(f"  [{completed}/{len(scenarios)}] done", end='\r')
-            all_data = [all_data_dict[k] for k in sorted(all_data_dict.keys())]
-            print(f"\n✓ CPU simulation complete: {len(all_data)}/{len(scenarios)} scenarios")
-
-        print()  # New line after progress
-        
-        # Concatenate all scenarios
-        full_df = pd.concat(all_data, ignore_index=True)
-        print(f"\n✓ Generated {len(full_df)} total samples from {len(all_data)} scenarios")
-        
-        # Split into train/val/test by scenario
-        n_scenarios = len(all_data)
-        n_train = int(n_scenarios * self.config.train_ratio)
-        n_val = int(n_scenarios * self.config.val_ratio)
-        
-        train_scenarios = list(range(n_train))
-        val_scenarios = list(range(n_train, n_train + n_val))
-        test_scenarios = list(range(n_train + n_val, n_scenarios))
-        
-        dataset = {
-            'train': full_df[full_df['scenario_id'].isin(train_scenarios)].reset_index(drop=True),
-            'val': full_df[full_df['scenario_id'].isin(val_scenarios)].reset_index(drop=True),
-            'test': full_df[full_df['scenario_id'].isin(test_scenarios)].reset_index(drop=True)
-        }
-        
-        print(f"\n✓ Dataset split:")
-        print(f"  Train: {len(dataset['train'])} samples ({len(train_scenarios)} scenarios)")
-        print(f"  Val:   {len(dataset['val'])} samples ({len(val_scenarios)} scenarios)")
-        print(f"  Test:  {len(dataset['test'])} samples ({len(test_scenarios)} scenarios)")
-        
-        return dataset
-    
-    def compute_normalization_params(
-        self,
-        train_df: pd.DataFrame
-    ) -> Dict[str, Dict[str, float]]:
-        """
-        Compute normalization parameters from training set.
-        
-        Parameters
-        ----------
-        train_df : pd.DataFrame
-            Training data
-        
-        Returns
-        -------
-        norm_params : dict
-            Normalization parameters (mean, std) for each feature
-        """
-        # Features to normalize
-        features = [
-            'current_A', 'voltage_V', 'temp_surface_C', 
-            'temp_ambient_C', 'soc', 'temp_core_C'
-        ]
-        
-        if self.config.add_noise:
-            features += [
-                'current_meas_A', 'voltage_meas_V', 
-                'temp_surface_meas_C', 'temp_ambient_meas_C'
-            ]
-        
-        norm_params = {}
-        for feature in features:
-            if feature in train_df.columns:
-                norm_params[feature] = {
-                    'mean': float(train_df[feature].mean()),
-                    'std': float(train_df[feature].std()),
-                    'min': float(train_df[feature].min()),
-                    'max': float(train_df[feature].max())
-                }
-        
-        return norm_params
-    
-    def save_dataset(
-        self,
-        dataset: Dict[str, pd.DataFrame],
-        norm_params: Dict[str, Dict[str, float]]
-    ):
-        """
-        Save dataset to disk.
-        
-        Parameters
-        ----------
-        dataset : dict
-            Dictionary with 'train', 'val', 'test' DataFrames
-        norm_params : dict
-            Normalization parameters
-        """
-        print("\n" + "="*80)
-        print("SAVING DATASET")
-        print("="*80 + "\n")
-        
-        if self.config.save_format == 'hdf5':
-            self._save_hdf5(dataset, norm_params)
-        elif self.config.save_format == 'csv':
-            self._save_csv(dataset, norm_params)
-        else:
-            raise ValueError(f"Unknown format: {self.config.save_format}")
-    
-    def _save_hdf5(
-        self,
-        dataset: Dict[str, pd.DataFrame],
-        norm_params: Dict[str, Dict[str, float]]
-    ):
-        """Save dataset in HDF5 format."""
-        hdf5_path = self.output_path / f"{self.config.dataset_name}.h5"
-        
-        with h5py.File(hdf5_path, 'w') as f:
-            # Save train/val/test splits
-            for split_name, df in dataset.items():
-                grp = f.create_group(split_name)
-                
-                # Save all columns as datasets
-                for col in df.columns:
-                    grp.create_dataset(col, data=df[col].values)
-                
-                # Add metadata
-                grp.attrs['n_samples'] = len(df)
-                grp.attrs['n_scenarios'] = df['scenario_id'].nunique()
-            
-            # Save normalization parameters
-            norm_grp = f.create_group('normalization')
-            norm_grp.attrs['params'] = json.dumps(norm_params)
-            
-            # Save dataset config
-            f.attrs['config'] = json.dumps(asdict(self.config), default=str)
-        
-        print(f"✓ HDF5 dataset saved: {hdf5_path}")
-        print(f"  Size: {hdf5_path.stat().st_size / 1024**2:.2f} MB")
-    
-    def _save_csv(
-        self,
-        dataset: Dict[str, pd.DataFrame],
-        norm_params: Dict[str, Dict[str, float]]
-    ):
-        """Save dataset in CSV format."""
-        for split_name, df in dataset.items():
-            csv_path = self.output_path / f"{self.config.dataset_name}_{split_name}.csv"
-            df.to_csv(csv_path, index=False)
-            print(f"✓ CSV saved: {csv_path} ({len(df)} samples)")
-        
-        # Save normalization params
-        norm_path = self.output_path / f"{self.config.dataset_name}_normalization.json"
-        with open(norm_path, 'w') as f:
-            json.dump(norm_params, f, indent=2)
-        print(f"✓ Normalization params saved: {norm_path}")
-        
-        # Save config
-        config_path = self.output_path / f"{self.config.dataset_name}_config.json"
-        with open(config_path, 'w') as f:
-            json.dump(asdict(self.config), f, indent=2, default=str)
-        print(f"✓ Config saved: {config_path}")
-    
-    def plot_dataset_statistics(self, dataset: Dict[str, pd.DataFrame]):
-        """
-        Plot dataset statistics and distributions.
-        
-        Parameters
-        ----------
-        dataset : dict
-            Dictionary with 'train', 'val', 'test' DataFrames
-        """
-        print("\n" + "="*80)
-        print("PLOTTING DATASET STATISTICS")
-        print("="*80 + "\n")
-        
-        fig, axes = plt.subplots(3, 3, figsize=(18, 12))
-        fig.suptitle('Dataset Statistics', fontsize=16, fontweight='bold')
-        
-        features = [
-            ('current_A', 'Current [A]'),
-            ('voltage_V', 'Voltage [V]'),
-            ('soc', 'SOC'),
-            ('temp_surface_C', 'Surface Temp [°C]'),
-            ('temp_core_C', 'Core Temp [°C]'),
-            ('temp_ambient_C', 'Ambient Temp [°C]'),
-            ('heat_generation_W', 'Heat Gen [W]'),
-            ('power_W', 'Power [W]')
-        ]
-        
-        for idx, (feature, label) in enumerate(features[:9]):
-            ax = axes[idx // 3, idx % 3]
-            
-            for split_name, color in [('train', 'blue'), ('val', 'orange'), ('test', 'green')]:
-                if feature in dataset[split_name].columns:
-                    data = dataset[split_name][feature].values
-                    ax.hist(data, bins=50, alpha=0.5, label=split_name, color=color, density=True)
-            
-            ax.set_xlabel(label, fontsize=10)
-            ax.set_ylabel('Density', fontsize=10)
-            ax.set_title(f'{label} Distribution', fontsize=11, fontweight='bold')
-            ax.legend(fontsize=9)
-            ax.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        
-        plot_path = self.output_path / f"{self.config.dataset_name}_statistics.png"
-        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-        print(f"✓ Statistics plot saved: {plot_path}")
-        plt.close()
 
 
 def main():

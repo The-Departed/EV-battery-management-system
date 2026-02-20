@@ -26,20 +26,20 @@ class DriveCycleLoader:
     # Standard drive cycle specifications
     CYCLE_SPECS = {
         'UDDS': {
-            'duration': 1369,  # seconds
-            'description': 'Urban Dynamometer Driving Schedule',
+            'duration': 12000,  # seconds (extended from 1369 for longer simulation)
+            'description': 'Urban Dynamometer Driving Schedule (Extended)',
             'max_current': 4.0,  # A (example for 18650 cell)
             'rms_current': 1.5,
         },
         'US06': {
-            'duration': 600,
-            'description': 'US06 Supplemental FTP Driving Schedule',
+            'duration': 12000,  # seconds (extended from 600 for longer simulation)
+            'description': 'US06 Supplemental FTP Driving Schedule (Extended)',
             'max_current': 6.0,  # A (aggressive)
             'rms_current': 2.5,
         },
         'HWFET': {
-            'duration': 765,
-            'description': 'Highway Fuel Economy Test Cycle',
+            'duration': 12000,  # seconds (extended from 765 for longer simulation)
+            'description': 'Highway Fuel Economy Test Cycle (Extended)',
             'max_current': 3.0,  # A (highway cruising)
             'rms_current': 1.8,
         },

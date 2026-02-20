@@ -1,10 +1,27 @@
 {
   "drive_cycles": [
     "UDDS",
+    "UDDS",
+    "UDDS",
+    "UDDS",
+    "UDDS",
     "US06",
+    "US06",
+    "US06",
+    "US06",
+    "US06",
+    "HWFET",
+    "HWFET",
+    "HWFET",
+    "HWFET",
     "HWFET"
   ],
   "temp_profiles": [
+    [
+      "constant",
+      -10,
+      0
+    ],
     [
       "constant",
       0,
@@ -12,7 +29,17 @@
     ],
     [
       "constant",
+      10,
+      0
+    ],
+    [
+      "constant",
       25,
+      0
+    ],
+    [
+      "constant",
+      40,
       0
     ],
     [
@@ -21,14 +48,35 @@
       0
     ],
     [
+      "constant",
+      60,
+      0
+    ],
+    [
       "sinusoidal",
       25,
+      10
+    ],
+    [
+      "sinusoidal",
+      10,
+      10
+    ],
+    [
+      "sinusoidal",
+      40,
       10
     ]
   ],
   "soc_initial_range": [
+    0.1,
+    0.2,
+    0.3,
+    0.4,
     0.5,
+    0.6,
     0.7,
+    0.8,
     0.9,
     1.0
   ],
