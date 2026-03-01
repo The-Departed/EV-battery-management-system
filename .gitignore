@@ -63,4 +63,3 @@ Thumbs.db
 *.pth
 *.pt
 *.ckpt
-results/datasets/battery_thermal_v1_train.csv
