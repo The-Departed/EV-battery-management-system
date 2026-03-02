@@ -3,13 +3,18 @@ import sys
 import os
 from pathlib import Path
 
+# Force all child processes to use GPU 1
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+
 def run_script(script_path):
     print(f"\n{'-'*60}")
     print(f"🚀 EXECUTING: {script_path}")
     print(f"{'-'*60}")
     
     # Run the script and stream the output directly to the console
-    result = subprocess.run([sys.executable, script_path], cwd=Path(__file__).parent)
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = "1"
+    result = subprocess.run([sys.executable, script_path], cwd=Path(__file__).parent, env=env)
     
     if result.returncode != 0:
         print(f"\n❌ ERROR: Script {script_path} crashed or failed.")

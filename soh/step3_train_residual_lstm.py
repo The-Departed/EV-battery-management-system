@@ -7,6 +7,8 @@ import numpy as np
 from pathlib import Path
 from torch.utils.data import DataLoader, TensorDataset
 
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "1")
+
 class ResidualLSTM(nn.Module):
     def __init__(self, input_size=3, hidden_size=64, num_layers=1):
         super(ResidualLSTM, self).__init__()
@@ -31,25 +33,45 @@ def create_sequences(data, seq_length=10):
 def train_residual_lstm():
     """
     Step 3: Train the LSTM to learn the error of the physics model (Residual Learning)
+    Trains on ALL 4 NASA batteries for a robust model.
     """
     base_dir = Path(__file__).parent.parent
     data_dir = base_dir / "data" / "nasa" / "processed"
     model_dir = base_dir / "soh" / "models"
     model_dir.mkdir(parents=True, exist_ok=True)
 
-    file_path = data_dir / "B0005_aging_features.csv"
-    if not file_path.exists():
-        print(f"⚠️ Processed file not found: {file_path}. Run Step 2 first.")
-        return
-
+    batteries = ["B0005", "B0006", "B0007", "B0018"]
+    
     # Check for Server GPU!
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"🧠 Training SOH Residual LSTM on {device}...")
     
-    df = pd.read_csv(file_path)
-    df['cycle'] = df['cycle'] / df['cycle'].max()
+    # Load and concatenate all batteries
+    dfs = []
+    for batt in batteries:
+        fp = data_dir / f"{batt}_aging_features.csv"
+        if not fp.exists():
+            print(f"⚠️ {fp.name} not found. Run Step 2 first.")
+            continue
+        df = pd.read_csv(fp)
+        df['cycle'] = df['cycle'] / df['cycle'].max()
+        dfs.append(df)
     
-    X, y = create_sequences(df, seq_length=10)
+    if not dfs:
+        print("❌ No data files found. Aborting.")
+        return
+    
+    # Create sequences from each battery separately (don't cross battery boundaries)
+    X_all, y_all = [], []
+    for df in dfs:
+        X, y = create_sequences(df, seq_length=10)
+        if len(X) > 0:
+            X_all.append(X)
+            y_all.append(y)
+    
+    X = np.concatenate(X_all)
+    y = np.concatenate(y_all)
+    print(f"   Combined dataset: {len(X)} sequences from {len(dfs)} batteries")
     
     dataset = TensorDataset(torch.from_numpy(X), torch.from_numpy(y).view(-1, 1))
     loader = DataLoader(dataset, batch_size=16, shuffle=True)
@@ -58,7 +80,7 @@ def train_residual_lstm():
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=0.005)
     
-    epochs = 150
+    epochs = 100
     for epoch in range(epochs):
         for inputs, targets in loader:
             inputs, targets = inputs.to(device), targets.to(device)
@@ -68,7 +90,7 @@ def train_residual_lstm():
             loss.backward()
             optimizer.step()
             
-        if (epoch+1) % 25 == 0:
+        if (epoch+1) % 10 == 0:
             print(f"Epoch [{epoch+1}/{epochs}], MSE Loss: {loss.item():.6f}")
 
     # Save the trained brain

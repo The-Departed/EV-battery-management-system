@@ -1,4 +1,6 @@
 # Python
+data/nasa/
+data/digital_twin_sets/
 __pycache__/
 *.py[cod]
 *$py.class

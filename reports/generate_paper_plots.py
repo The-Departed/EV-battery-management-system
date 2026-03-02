@@ -1,230 +1,238 @@
+"""
+Step 6: Generate Paper-Quality Plots from Real Pipeline Data
+=============================================================
+All plots are driven by ACTUAL pipeline outputs, not mock data.
+"""
+
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import os
+from pathlib import Path
 
-def check_results_dir():
+
+def ensure_dir():
     os.makedirs('results/paper_plots', exist_ok=True)
 
-def generate_figure_group_1_vt_surface():
-    """
-    Figure Group 1: (a) Terminal Voltage & Absolute Error, (b) Surface Temperature Estimated vs Measured.
-    """
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
-    time = np.linspace(0, 3000, 300)
-    
-    # Mock data
-    vt_actual = 4.2 - 0.0005 * time + np.sin(time/100)*0.1
-    vt_predicted = vt_actual + np.random.normal(0, 0.02, 300)
-    error = np.abs(vt_actual - vt_predicted)
 
-    # Subplot (a) - Voltage and Error
-    ax1.plot(time, vt_predicted, label='Vt_Predicted', color='blue', alpha=0.8)
-    ax1.plot(time, vt_actual, label='Vt_Actual', color='orange', alpha=0.8)
-    ax1.set_xlabel('Discharge Time (s)')
+def load_twin_data():
+    """Load the experimentally-tuned digital twin dataset."""
+    p = Path('data/digital_twin_sets/augmented_aging_twin_dataset.csv')
+    if not p.exists():
+        print(f"⚠️ {p} not found. Run Step 4 first.")
+        return None
+    return pd.read_csv(p)
+
+
+def load_aging_data(battery='B0005'):
+    """Load per-cycle aging features."""
+    p = Path(f'data/nasa/processed/{battery}_aging_features.csv')
+    if not p.exists():
+        return None
+    return pd.read_csv(p)
+
+
+# ---- Figure 1: ECM Voltage Validation ----
+def fig1_voltage_validation(df):
+    """Real vs Simulated terminal voltage for a sample cycle."""
+    # Pick a mid-aging cycle from B0005
+    b5 = df[df['battery'] == 'B0005']
+    mid_cycle = sorted(b5['cycle'].unique())[len(b5['cycle'].unique()) // 2]
+    cyc = b5[b5['cycle'] == mid_cycle]
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+
+    ax1.plot(cyc['time_s'], cyc['voltage_V'], label='V_measured (NASA)', color='blue', alpha=0.8)
+    ax1.plot(cyc['time_s'], cyc['voltage_sim_V'], label='V_simulated (2-RC ECM)', color='orange',
+             linestyle='--', alpha=0.8)
     ax1.set_ylabel('Terminal Voltage (V)')
-    
-    ax1_err = ax1.twinx()
-    ax1_err.plot(time, error, label='Absolute Error', color='red', linewidth=1)
-    ax1_err.set_ylabel('Absolute Error in Vt (V)')
-    
-    ax1.legend(loc='lower right')
-    ax1_err.legend(loc='upper center')
+    ax1.legend(loc='lower left')
     ax1.grid(True, linestyle='--', alpha=0.6)
-    ax1.set_title('(a)', y=-0.15)
+    ax1.set_title(f'ECM Voltage Validation — B0005 Cycle {mid_cycle} (SOH={cyc["soh_true"].iloc[0]:.3f})')
 
-    # Subplot (b) - Surface Temp
-    ts_measured = 298 + 0.005 * time + np.random.normal(0, 0.1, 300)
-    ts_estimated = 298 + 0.0048 * time
-    
-    ax2.plot(time, ts_measured, label='Measured', color='blue')
-    ax2.plot(time, ts_estimated, label='Estimated', color='green')
-    ax2.set_xlabel('Discharge Time (s)')
-    ax2.set_ylabel('Surface Temperature (K)')
-    ax2.legend(loc='upper left')
+    error = np.abs(cyc['voltage_V'].values - cyc['voltage_sim_V'].values)
+    ax2.plot(cyc['time_s'], error * 1000, color='red')
+    ax2.set_ylabel('|Error| (mV)')
+    ax2.set_xlabel('Time (s)')
     ax2.grid(True, linestyle='--', alpha=0.6)
-    ax2.set_title('(b)', y=-0.15)
 
     plt.tight_layout()
-    plt.savefig('results/paper_plots/fig_group_1_vt_temp.png', dpi=300, bbox_inches='tight')
+    plt.savefig('results/paper_plots/fig1_voltage_validation.png', dpi=300, bbox_inches='tight')
     plt.close()
+    print("  ✅ fig1_voltage_validation.png")
 
 
-def generate_figure_group_2_hwft():
-    """
-    Figure Group 2: HWFT Cycle (a) Discharge Current, (b) Core Temp at Various Ambients, (c) Cell Voltage
-    """
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5))
-    time = np.linspace(0, 2000, 400)
-    
-    # Subplot (a) - HWFT Current
-    current = np.abs(np.sin(time/50) * 18 * np.random.uniform(0.5, 1, 400))
-    ax1.plot(time, current, color='red')
-    ax1.set_xlabel('Discharge Time (s)')
-    ax1.set_ylabel('Discharge Current (A)')
-    ax1.grid(True)
-    ax1.set_title('(a)', y=-0.2)
+# ---- Figure 2: Thermal Model Validation (Surface Temp) ----
+def fig2_surface_temp_validation(df):
+    """Simulated vs Measured surface temperature — proof of thermal calibration."""
+    b5 = df[df['battery'] == 'B0005']
+    # Pick early, mid, late cycles
+    cycles = sorted(b5['cycle'].unique())
+    picks = [cycles[5], cycles[len(cycles)//2], cycles[-5]]
 
-    # Subplot (b) - Core Temp
-    tc_273 = 273 + (time/200)**1.2
-    tc_293 = 293 + (time/180)**1.3
-    tc_323 = 323 + (time/150)**1.4
-    ax2.plot(time, tc_273, label='Tc_273K', color='blue')
-    ax2.plot(time, tc_293, label='Tc_293K', color='red')
-    ax2.plot(time, tc_323, label='Tc_323K', color='green')
-    ax2.set_xlabel('Discharge Time (s)')
-    ax2.set_ylabel('Core Temperature (K)')
-    ax2.legend(loc='upper right')
-    ax2.grid(True)
-    ax2.set_title('(b)', y=-0.2)
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    for ax, cyc_num in zip(axes, picks):
+        cyc = b5[b5['cycle'] == cyc_num]
+        ax.plot(cyc['time_s'], cyc['temp_surface_C'], label='Ts_measured (NASA)', color='blue')
+        ax.plot(cyc['time_s'], cyc['temp_surface_sim_C'], label='Ts_simulated (EETM)',
+                color='green', linestyle='--')
+        rmse = np.sqrt(np.mean((cyc['temp_surface_C'].values - cyc['temp_surface_sim_C'].values)**2))
+        ax.set_title(f'Cycle {cyc_num} (SOH={cyc["soh_true"].iloc[0]:.3f})\nRMSE={rmse:.3f}°C')
+        ax.set_xlabel('Time (s)')
+        ax.set_ylabel('Surface Temperature (°C)')
+        ax.legend(loc='upper left')
+        ax.grid(True, linestyle='--', alpha=0.6)
 
-    # Subplot (c) - Cell Voltage
-    voltage = 4.2 - (time/2000)*1.8 - np.sin(time/20)*0.1
-    ax3.plot(time, voltage, color='blue')
-    ax3.set_xlabel('Discharge Time (s)')
-    ax3.set_ylabel('Cell Voltage (V)')
-    ax3.grid(True)
-    ax3.set_title('(c)', y=-0.2)
-
+    plt.suptitle('EETM Surface Temp Validation — Tuned Against Real NASA Data', fontsize=13)
     plt.tight_layout()
-    plt.savefig('results/paper_plots/fig_group_2_hwft.png', dpi=300, bbox_inches='tight')
+    plt.savefig('results/paper_plots/fig2_surface_temp_validation.png', dpi=300, bbox_inches='tight')
     plt.close()
+    print("  ✅ fig2_surface_temp_validation.png")
 
-def generate_figure_group_3_pulse():
-    """Figure Group 3: Pulse Driving Profiles"""
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5))
-    time = np.linspace(0, 500, 500)
-    
-    # Generate Pulse Pattern
-    current = np.zeros(500)
-    for i in range(5):
-        current[i*100:i*100+30] = 18 # 18A pulse for 30 seconds
-        
-    ax1.plot(time, current, color='red')
-    ax1.set_xlabel('Discharge Time (s)')
-    ax1.set_ylabel('Discharge Current (A)')
-    ax1.grid(True)
-    ax1.set_title('(a)', y=-0.2)
-    
-    tc_273 = 273 + np.cumsum(current)*0.005
-    tc_293 = 293 + np.cumsum(current)*0.006
-    tc_323 = 323 + np.cumsum(current)*0.007
-    ax2.plot(time, tc_273, label='Tc_273K', color='blue')
-    ax2.plot(time, tc_293, label='Tc_293K', color='red')
-    ax2.plot(time, tc_323, label='Tc_323K', color='green')
-    ax2.set_xlabel('Discharge Time (s)')
-    ax2.set_ylabel('Core Temperature (K)')
-    ax2.legend()
-    ax2.grid(True)
-    ax2.set_title('(b)', y=-0.2)
-    
-    voltage = 4.1 - current*0.02 - time*0.001
-    ax3.plot(time, voltage, color='blue')
-    ax3.set_xlabel('Discharge Time (s)')
-    ax3.set_ylabel('Cell Voltage (V)')
-    ax3.grid(True)
-    ax3.set_title('(c)', y=-0.2)
-    
+
+# ---- Figure 3: Core Temperature Prediction (the key result) ----
+def fig3_core_temp_prediction(df):
+    """Surface vs predicted Core temperature showing thermal inertia."""
+    b5 = df[df['battery'] == 'B0005']
+    cycles = sorted(b5['cycle'].unique())
+    picks = [cycles[5], cycles[len(cycles)//2], cycles[-5]]
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    for ax, cyc_num in zip(axes, picks):
+        cyc = b5[b5['cycle'] == cyc_num]
+        ax.plot(cyc['time_s'], cyc['temp_surface_C'], label='T_surface (measured)', color='blue')
+        ax.plot(cyc['time_s'], cyc['temp_core_C_TARGET'], label='T_core (physics twin)',
+                color='red', linewidth=2)
+        delta = cyc['temp_core_C_TARGET'].values - cyc['temp_surface_C'].values
+        ax.fill_between(cyc['time_s'], cyc['temp_surface_C'], cyc['temp_core_C_TARGET'],
+                        alpha=0.15, color='red', label=f'ΔT max={delta.max():.2f}°C')
+        ax.set_title(f'Cycle {cyc_num} (SOH={cyc["soh_true"].iloc[0]:.3f})')
+        ax.set_xlabel('Time (s)')
+        ax.set_ylabel('Temperature (°C)')
+        ax.legend(loc='upper left')
+        ax.grid(True, linestyle='--', alpha=0.6)
+
+    plt.suptitle('Core vs Surface Temperature — Physics Digital Twin', fontsize=13)
     plt.tight_layout()
-    plt.savefig('results/paper_plots/fig_group_3_pulse.png', dpi=300, bbox_inches='tight')
+    plt.savefig('results/paper_plots/fig3_core_temperature.png', dpi=300, bbox_inches='tight')
     plt.close()
+    print("  ✅ fig3_core_temperature.png")
 
-def generate_figure_group_4_udds_actual_vs_est():
-    """Figure Group 4: UDDS Cycle Actual vs Estimated"""
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5))
-    time = np.linspace(0, 1400, 300)
-    
-    def plot_udds_subplot(ax, ambient, title_letter):
-        actual = ambient + (time/100)**1.1 + np.sin(time/30)*0.5
-        estimated = actual + np.random.normal(0, 0.15, 300)
-        ax.plot(time, actual, label='Actual', color='blue')
-        ax.plot(time, estimated, label='Estimated', color='orange')
-        ax.set_xlabel('Drive Cycle Time (s)')
-        ax.set_ylabel('Core Temperature (K)')
-        ax.legend()
-        ax.grid(True)
-        ax.set_title(f'({title_letter}) Ambient {ambient}K', y=-0.2)
 
-    plot_udds_subplot(ax1, 273, 'a')
-    plot_udds_subplot(ax2, 293, 'b')
-    plot_udds_subplot(ax3, 323, 'c')
-    
-    plt.tight_layout()
-    plt.savefig('results/paper_plots/fig_group_4_udds.png', dpi=300, bbox_inches='tight')
-    plt.close()
+# ---- Figure 4: ECM Parameter Evolution with Aging ----
+def fig4_parameter_aging(df):
+    """Show how identified R0 grows with aging (SOH decay)."""
+    # One R0 per cycle
+    cycle_params = df.groupby(['battery', 'cycle']).agg(
+        soh=('soh_true', 'first'),
+        R0=('r0_ohms', 'first'),
+        R1=('r1_ohms', 'first'),
+        R2=('r2_ohms', 'first'),
+    ).reset_index()
 
-def generate_figure_group_5_method_comparison():
-    """Figure Group 5: Method comparison and Error"""
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-    time = np.linspace(0, 1400, 300)
-    
-    actual = 293 + (time/100)**1.2
-    ekf_est = actual + np.sin(time/50)*0.3
-    glstm_est = actual + np.sin(time/70)*0.1
-    pf_est = actual + np.random.normal(0, 0.2, 300)
-    
-    ax1.plot(time, actual, label='Actual', color='blue', linewidth=2)
-    ax1.plot(time, ekf_est, label='LNN_EKF', color='orange')
-    ax1.plot(time, glstm_est, label='2D-GLSTM', color='green')
-    ax1.plot(time, pf_est, label='LNN_Particle Filter', color='red')
-    ax1.set_xlabel('Drive Cycle Time (s)')
-    ax1.set_ylabel('Core Temperature (K)')
-    ax1.legend(loc='upper right')
-    ax1.grid(True)
-    ax1.set_title('(a)', y=-0.15)
-    
-    ax2.plot(time, ekf_est - actual, label='LNN_EKF', color='orange')
-    ax2.plot(time, glstm_est - actual, label='2D-GLSTM', color='green')
-    ax2.plot(time, pf_est - actual, label='LNN_Particle Filter', color='red')
-    ax2.axhline(0, color='black', linewidth=1)
-    ax2.set_xlabel('Drive Cycle Time (s)')
-    ax2.set_ylabel('Core Temperature Estimation Error (K)')
-    ax2.legend()
-    ax2.grid(True)
-    ax2.set_ylim(-0.4, 0.4)
-    ax2.set_title('(b)', y=-0.15)
-    
-    plt.tight_layout()
-    plt.savefig('results/paper_plots/fig_group_5_comparisons.png', dpi=300, bbox_inches='tight')
-    plt.close()
 
-def generate_soh_plots():
-    """Extra requested plots: SOH Residual Learning & ECM Resistance Tracking"""
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-    cycles = np.linspace(1, 160, 160)
-    
-    # Plot SOH Residual Learning
-    soh_true = 1.0 - (cycles/200)**1.5
-    soh_physics = 1.0 - (cycles/200)**1.2 # Bias in physics
-    residual = soh_true - soh_physics
-    
-    ax1.plot(cycles, soh_true, label='SOH_True (Ground Truth)', color='black', linewidth=2)
-    ax1.plot(cycles, soh_physics, label='SOH_Physics (Baseline)', color='blue', linestyle='--')
-    ax1.bar(cycles, residual, label='LSTM Residual Correction', color='red', alpha=0.5)
-    ax1.set_xlabel('Cycle Number')
-    ax1.set_ylabel('State of Health (SOH)')
-    ax1.set_title('Residual Learning: SOH Estimation')
+    for batt, grp in cycle_params.groupby('battery'):
+        ax1.plot(grp['cycle'], grp['R0'] * 1000, 'o-', markersize=2, label=batt)
+    ax1.set_xlabel('Discharge Cycle')
+    ax1.set_ylabel('R0 (mΩ)')
+    ax1.set_title('Internal Resistance Growth with Aging')
     ax1.legend()
-    ax1.grid(True)
-    
-    # Plot Internal Resistance Growth
-    r0 = 0.05 + 0.04 * (1 - soh_true)
-    ax2.plot(cycles, r0, color='purple', linewidth=2)
-    ax2.set_xlabel('Cycle Number')
-    ax2.set_ylabel('Internal Resistance R0 (Ohms)')
-    ax2.set_title('Aging-Aware ECM: Resistance vs Cycles')
-    ax2.grid(True)
-    
+    ax1.grid(True, linestyle='--', alpha=0.6)
+
+    for batt, grp in cycle_params.groupby('battery'):
+        ax2.plot(grp['cycle'], grp['soh'], 'o-', markersize=2, label=batt)
+    ax2.set_xlabel('Discharge Cycle')
+    ax2.set_ylabel('SOH')
+    ax2.set_title('Capacity Fade (State of Health)')
+    ax2.legend()
+    ax2.grid(True, linestyle='--', alpha=0.6)
+
     plt.tight_layout()
-    plt.savefig('results/paper_plots/fig_group_6_soh_residual.png', dpi=300, bbox_inches='tight')
+    plt.savefig('results/paper_plots/fig4_parameter_aging.png', dpi=300, bbox_inches='tight')
     plt.close()
+    print("  ✅ fig4_parameter_aging.png")
+
+
+# ---- Figure 5: SOH Residual Learning ----
+def fig5_soh_residual(battery='B0005'):
+    """Show SOH ground truth vs physics baseline vs residual correction."""
+    df = load_aging_data(battery)
+    if df is None:
+        print(f"  ⚠️ Skipping SOH plot — no aging data for {battery}")
+        return
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    ax1.plot(df['cycle'], df['soh_true'], 'k-', linewidth=2, label='SOH_true (NASA)')
+    ax1.plot(df['cycle'], df['soh_physics_baseline'], 'b--', label='SOH_physics (biased)')
+    ax1.bar(df['cycle'], df['residual_target'], color='red', alpha=0.4,
+            label='Residual (LSTM target)')
+    ax1.set_xlabel('Cycle')
+    ax1.set_ylabel('SOH / Residual')
+    ax1.set_title(f'{battery}: Residual Learning Setup')
+    ax1.legend()
+    ax1.grid(True, linestyle='--', alpha=0.6)
+
+    ax2.plot(df['cycle'], df['r_internal_ohms'] * 1000, 'purple', linewidth=2)
+    ax2.set_xlabel('Cycle')
+    ax2.set_ylabel('R_internal (mΩ)')
+    ax2.set_title(f'{battery}: Internal Resistance from Pulse Response')
+    ax2.grid(True, linestyle='--', alpha=0.6)
+
+    plt.tight_layout()
+    plt.savefig('results/paper_plots/fig5_soh_residual.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print("  ✅ fig5_soh_residual.png")
+
+
+# ---- Figure 6: Current Profile and Thermal Response ----
+def fig6_drive_thermal(df):
+    """Show drive current and resulting thermal response for one cycle."""
+    b5 = df[df['battery'] == 'B0005']
+    mid_cycle = sorted(b5['cycle'].unique())[len(b5['cycle'].unique()) // 2]
+    cyc = b5[b5['cycle'] == mid_cycle]
+
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+
+    ax1.plot(cyc['time_s'], np.abs(cyc['current_A']), color='red')
+    ax1.set_ylabel('|Current| (A)')
+    ax1.set_title(f'B0005 Cycle {mid_cycle} — Discharge Profile & Thermal Response')
+    ax1.grid(True, linestyle='--', alpha=0.6)
+
+    ax2.plot(cyc['time_s'], cyc['voltage_V'], color='blue')
+    ax2.set_ylabel('Voltage (V)')
+    ax2.grid(True, linestyle='--', alpha=0.6)
+
+    ax3.plot(cyc['time_s'], cyc['temp_surface_C'], label='T_surface', color='blue')
+    ax3.plot(cyc['time_s'], cyc['temp_core_C_TARGET'], label='T_core', color='red', linewidth=2)
+    ax3.set_ylabel('Temperature (°C)')
+    ax3.set_xlabel('Time (s)')
+    ax3.legend()
+    ax3.grid(True, linestyle='--', alpha=0.6)
+
+    plt.tight_layout()
+    plt.savefig('results/paper_plots/fig6_drive_thermal.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print("  ✅ fig6_drive_thermal.png")
+
 
 if __name__ == "__main__":
-    print("Generating Paper Quality Benchmark Figures...")
-    check_results_dir()
-    generate_figure_group_1_vt_surface()
-    generate_figure_group_2_hwft()
-    generate_figure_group_3_pulse()
-    generate_figure_group_4_udds_actual_vs_est()
-    generate_figure_group_5_method_comparison()
-    generate_soh_plots()
-    print("✅ Successfully generated all 6 Figure Groups in 'results/paper_plots/'")
+    print("📊 Generating Paper Plots from Real Pipeline Data...")
+    ensure_dir()
+
+    df = load_twin_data()
+    if df is not None:
+        fig1_voltage_validation(df)
+        fig2_surface_temp_validation(df)
+        fig3_core_temp_prediction(df)
+        fig4_parameter_aging(df)
+        fig6_drive_thermal(df)
+    else:
+        print("⚠️ No digital twin data — skipping thermal plots.")
+
+    fig5_soh_residual('B0005')
+
+    print("\n✅ All figures saved to results/paper_plots/")
