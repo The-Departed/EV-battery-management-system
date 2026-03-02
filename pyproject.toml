@@ -17,6 +17,8 @@ dependencies = [
     "pybamm>=23.9",
     "openpyxl>=3.1.5",
     "xlrd>=2.0.2",
+    "streamlit>=1.50.0",
+    "plotly>=6.6.0",
 ]
 
 [tool.uv]
