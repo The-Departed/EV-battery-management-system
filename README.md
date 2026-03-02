@@ -1,50 +1,46 @@
-# EV Battery Core Temperature Estimation
+# Grand Unified Battery Architecture: Server Execution Guide
 
-A comprehensive physics-informed machine learning pipeline to estimate the internal core temperature of Li-ion batteries using surface and electrical measurements.
+This repository contains the full 5-part AI pipeline for an EV Battery State of Health (SOH) and Core Temperature (Tc) prediction system. It is designed to be executed sequentially, heavily utilizing **GPU (CUDA)** to accelerate dataset simulation and train the deep learning models.
 
-## The Approach
+## Pre-Requisites (For the Server)
+Make sure the server environment is set up. You will need:
+- An NVIDIA GPU available for PyTorch.
+- Python 3.8+
 
-This project combines traditional electrical engineering (ECM/EETM) with modern AI (Transformers) to solve the difficult problem of internal battery temperature prediction:
-
-1. **`ecm/` (Electrical Circuit Model):** Uses a 2-RC Thevenin circuit to model the battery's electrical behavior `V(t), SOC(t)`.
-2. **`eetm/` (Electrical-Equivalent Thermal Model):** Uses a 2-state thermal model to calculate heat generation `Q(t)` and predict surface/core temperatures mathematically.
-3. **`generation/` (Synthetic Batch Simulator):** Runs thousands of hours of driving scenarios (UDDS, US06, HWFET) through the ECM+EETM physics engine to generate massive datasets with added sensor noise.
-4. **`transformer/` (AI Predictor):** Trains a mixed-precision multi-layer Transformer on the physics-generated data to predict `Core Temperature (Tc)` using only outside observable variables `[Current, Voltage, SOC, Surface Temp, Ambient Temp]`.
-
-## Clean Project Structure
-
-```text
-EV-battery-management-system/
-├── ecm/              # Phase 1: Electrical modeling (OCV, RC parameters)
-├── eetm/             # Phase 2: Thermal modeling & heat generation
-├── generation/       # Phase 3: GPU-Batched synthetic data generation
-├── transformer/      # Phase 4: Transformer model & evaluation
-├── data/             # Raw NASA reference data 
-├── results/          # Output model weights, datasets, and plots
-├── docs/             # Technical specifications and API guides
-├── reports/          # Development progress logs from Phases 1-3
-├── run_all.py        # Master pipeline execution script
-└── README.md
-```
-
-## Quick Start
-The environment is managed using `uv`. All code is highly optimized to use parallel multiprocessing on CPUs and Mixed Precision (AMP) on GPUs.
-
+Install required libraries:
 ```bash
-# Initialize uv environment
-uv sync
-
-# 1. Generate Synthetic Data (GPU accelerated if available, otherwise CPU map)
-python run_all.py --step generate
-
-# 2. Train Transformer Model (GPU Enabled)
-python run_all.py --step train --epochs 10
-
-# OR Run Everything at Once:
-python run_all.py --step all
+pip install torch numpy pandas scipy matplotlib requests streamlit
 ```
 
-### Outputs
-- **Datasets**: `results/datasets/` (Train/Val/Test CSVs + Distribution plots)
-- **Model Results**: `results/model/` (Predictions CSV + Final accuracy figures reproducing paper standards)
+## How to Run the Pipeline
+All mathematical equations (2-RC ECM + 2-State EETM, SOH Residual Learning, Internal Resistance approximations) have already been coded and saved securely into the root folders.
 
+You do not need to hunt down individual scripts. **All scripts, data loading, Physics generation, AI training, and model saves are handled by one execution script.**
+
+### 1. Launch the Pipeline
+Run the following command from the root folder:
+```bash
+python run_pipeline.py
+```
+**What this will do:**
+- **Step 1:** Download the raw baseline 18650 Battery cells from the NASA Ames Prognostics center `(B0005.mat, B0006.mat...)`.
+- **Step 2:** Parse the `.mat` data. It extracts the Ground Truth Capacity and approximates the internal resistance ($R = \Delta V / \Delta I$). 
+- **Step 3:** Train a **PyTorch LSTM** on the GPU to learn the $Residual$ error of the Coulomb SOH counting method.
+- **Step 4:** Leverage the GPU via **PyTorch tensors** to simulate over **333 hours** of dynamic driving data across 800 parallel environments where Resistance naturally grows with SOH.
+- **Step 5:** Train the **PyTorch Transformer** on the server GPU, using an overlapping 60-second sliding window over those 333 hours of generated data, learning to perfectly predict `Core Temperature (Tc)`.
+- **Plot Generation:** Outputs 6 highly specific, paper-ready PNG graphics into `results/paper_plots/`.
+
+*(Note: Ensure your server does not sleep during Step 5, as the transformer will iterate millions of sequences.)*
+
+### 2. View The Results
+- Trained Models: `.pth` files will automatically be saved into `soh/models/` and `transformer/models/`.
+- Generated Data: 333 hours of simulated Physics Ground Truth is exported as CSVs inside `data/digital_twin_sets/`.
+- Presentation Figures: All plots generated are found in `results/paper_plots/`.
+
+### 3. Launch The User Interface
+If your server exposes ports (or if you sync the `.pth` files to your local machine), launch the interactive dashboard:
+```bash
+streamlit run run_ui_dashboard.py
+```
+
+*All architectural diagrams and project planning documents have been retained in the `docs_gemini_architectural_plans` directory.*
