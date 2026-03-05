@@ -27,8 +27,12 @@ import torch.nn as nn
 import torch.optim as optim
 import pandas as pd
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 from pathlib import Path
 from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "1")
 
@@ -40,8 +44,8 @@ class BatteryThermalTransformer(nn.Module):
     Input:  [batch, seq_len, feature_dim]
     Output: [batch, 1]  (predicted core temperature at next timestep)
     """
-    def __init__(self, feature_dim=4, d_model=64, nhead=4, num_layers=3,
-                 dim_feedforward=128, dropout=0.1):
+    def __init__(self, feature_dim=4, d_model=128, nhead=4, num_layers=4,
+                 dim_feedforward=256, dropout=0.1):
         super().__init__()
         self.embedding = nn.Linear(feature_dim, d_model)
         self.pos_encoding = nn.Parameter(torch.randn(1, 512, d_model) * 0.02)
@@ -96,22 +100,36 @@ def create_sliding_windows(df, window_size=60, stride=1):
 def train_thermal_transformer():
     """
     Step 5: Train the Transformer on the experimentally-tuned Digital Twin data.
+    Includes 80/20 train/val split (sklearn) and saves loss curves.
     """
     base_dir = Path(__file__).parent.parent
     data_dir = base_dir / "data" / "digital_twin_sets"
     model_dir = base_dir / "transformer" / "models"
+    plot_dir = base_dir / "results" / "paper_plots"
     model_dir.mkdir(parents=True, exist_ok=True)
+    plot_dir.mkdir(parents=True, exist_ok=True)
 
+    # Load both NASA twin data AND EV validation data
     file_path = data_dir / "augmented_aging_twin_dataset.csv"
-    if not file_path.exists():
+    ev_path = base_dir / "data" / "ev_validation_sets" / "ev_drive_cycle_dataset.csv"
+
+    frames = []
+    if file_path.exists():
+        frames.append(pd.read_csv(file_path))
+        print(f"   Loaded NASA twin data: {len(frames[-1])} rows")
+    else:
         print(f"⚠️ Dataset not found: {file_path}. Run Step 4 first.")
         return
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"🧠 Loading dataset and preparing sliding windows on {device}...")
+    if ev_path.exists():
+        frames.append(pd.read_csv(ev_path))
+        print(f"   Loaded EV drive-cycle data: {len(frames[-1])} rows")
 
-    df = pd.read_csv(file_path)
-    print(f"   Dataset: {len(df)} rows, {df['battery'].nunique()} batteries, "
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"🧠 Preparing training data on {device}...")
+
+    df = pd.concat(frames, ignore_index=True)
+    print(f"   Combined dataset: {len(df)} rows, {df['battery'].nunique()} batteries, "
           f"{df.groupby('battery')['cycle'].nunique().sum()} cycles")
 
     # --- Normalisation (per-feature z-score) ---
@@ -137,14 +155,11 @@ def train_thermal_transformer():
         print("⚠️ No valid sequences generated. Check data.")
         return
 
-    # --- Train / Val split (80/20 by cycle to prevent leakage) ---
-    n = len(X)
-    perm = np.random.RandomState(42).permutation(n)
-    split = int(0.8 * n)
-    train_idx, val_idx = perm[:split], perm[split:]
-
-    X_train, y_train = X[train_idx], y[train_idx]
-    X_val, y_val = X[val_idx], y[val_idx]
+    # --- Train / Val split (80/20 via sklearn) ---
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
+    print(f"   Train: {len(X_train)} | Val: {len(X_val)}")
 
     train_ds = TensorDataset(torch.from_numpy(X_train),
                              torch.from_numpy(y_train).unsqueeze(1))
@@ -168,6 +183,9 @@ def train_thermal_transformer():
 
     epochs = 100
     best_val_loss = float('inf')
+    train_losses = []
+    val_losses = []
+
     print(f"🚀 Training Transformer ({sum(p.numel() for p in model.parameters()):,} params) "
           f"on {device} for {epochs} epochs...")
 
@@ -197,6 +215,9 @@ def train_thermal_transformer():
 
         scheduler.step()
 
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save(model.state_dict(), model_dir / "transformer_thermal_core.pth")
@@ -220,6 +241,20 @@ def train_thermal_transformer():
     stats_df = pd.DataFrame(stats, index=['mean', 'std'])
     stats_df.to_csv(model_dir / "normalisation_stats.csv")
     print(f"   Normalisation stats saved to: transformer/models/normalisation_stats.csv")
+
+    # ---- Plot Training & Validation Loss Curves ----
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(range(1, epochs + 1), train_losses, color='blue', linewidth=1.5, label='Training Loss')
+    ax.plot(range(1, epochs + 1), val_losses, color='orange', linewidth=1.5, label='Validation Loss')
+    ax.set_xlabel('Epoch', fontsize=12)
+    ax.set_ylabel('MSE Loss (normalised)', fontsize=12)
+    ax.set_title('Transformer Core Temperature — Training & Validation Loss', fontsize=14)
+    ax.legend(fontsize=11)
+    ax.grid(True, linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(str(plot_dir / 'transformer_training_loss.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"📈 Loss curve saved to results/paper_plots/transformer_training_loss.png")
 
 
 if __name__ == "__main__":

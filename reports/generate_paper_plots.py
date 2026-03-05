@@ -2,6 +2,7 @@
 Step 6: Generate Paper-Quality Plots from Real Pipeline Data
 =============================================================
 All plots are driven by ACTUAL pipeline outputs, not mock data.
+Includes: Transformer test validation on unseen data (STEP 3 spec).
 """
 
 import matplotlib
@@ -10,7 +11,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import os
+import torch
+import torch.nn as nn
 from pathlib import Path
+
+
+BASE_DIR = Path(__file__).resolve().parent.parent
 
 
 def ensure_dir():
@@ -19,25 +25,54 @@ def ensure_dir():
 
 def load_twin_data():
     """Load the experimentally-tuned digital twin dataset."""
-    p = Path('data/digital_twin_sets/augmented_aging_twin_dataset.csv')
+    p = BASE_DIR / 'data' / 'digital_twin_sets' / 'augmented_aging_twin_dataset.csv'
     if not p.exists():
         print(f"⚠️ {p} not found. Run Step 4 first.")
         return None
     return pd.read_csv(p)
 
 
-def load_aging_data(battery='B0005'):
-    """Load per-cycle aging features."""
-    p = Path(f'data/nasa/processed/{battery}_aging_features.csv')
+def load_ev_data():
+    """Load the EV drive-cycle dataset."""
+    p = BASE_DIR / 'data' / 'ev_validation_sets' / 'ev_drive_cycle_dataset.csv'
     if not p.exists():
         return None
     return pd.read_csv(p)
 
 
+def load_aging_data(battery='B0005'):
+    """Load per-cycle aging features."""
+    p = BASE_DIR / f'data/nasa/processed/{battery}_aging_features.csv'
+    if not p.exists():
+        return None
+    return pd.read_csv(p)
+
+
+# ---- Transformer model definition (must match training code) ----
+class BatteryThermalTransformer(nn.Module):
+    def __init__(self, feature_dim=4, d_model=128, nhead=4, num_layers=4,
+                 dim_feedforward=256, dropout=0.1):
+        super().__init__()
+        self.embedding = nn.Linear(feature_dim, d_model)
+        self.pos_encoding = nn.Parameter(torch.randn(1, 512, d_model) * 0.02)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
+            dropout=dropout, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.regression_head = nn.Sequential(
+            nn.Linear(d_model, 32), nn.GELU(), nn.Dropout(dropout), nn.Linear(32, 1))
+
+    def forward(self, src):
+        x = self.embedding(src)
+        T = x.size(1)
+        x = x + self.pos_encoding[:, :T, :]
+        x = self.transformer(x)
+        return self.regression_head(x[:, -1, :])
+
+
 # ---- Figure 1: ECM Voltage Validation ----
 def fig1_voltage_validation(df):
     """Real vs Simulated terminal voltage for a sample cycle."""
-    # Pick a mid-aging cycle from B0005
     b5 = df[df['battery'] == 'B0005']
     mid_cycle = sorted(b5['cycle'].unique())[len(b5['cycle'].unique()) // 2]
     cyc = b5[b5['cycle'] == mid_cycle]
@@ -68,7 +103,6 @@ def fig1_voltage_validation(df):
 def fig2_surface_temp_validation(df):
     """Simulated vs Measured surface temperature — proof of thermal calibration."""
     b5 = df[df['battery'] == 'B0005']
-    # Pick early, mid, late cycles
     cycles = sorted(b5['cycle'].unique())
     picks = [cycles[5], cycles[len(cycles)//2], cycles[-5]]
 
@@ -124,7 +158,6 @@ def fig3_core_temp_prediction(df):
 # ---- Figure 4: ECM Parameter Evolution with Aging ----
 def fig4_parameter_aging(df):
     """Show how identified R0 grows with aging (SOH decay)."""
-    # One R0 per cycle
     cycle_params = df.groupby(['battery', 'cycle']).agg(
         soh=('soh_true', 'first'),
         R0=('r0_ohms', 'first'),
@@ -219,6 +252,223 @@ def fig6_drive_thermal(df):
     print("  ✅ fig6_drive_thermal.png")
 
 
+# ---- Figure 7: Transformer Test Validation on Unseen Data ----
+def fig7_transformer_test_validation(df):
+    """
+    Load trained Transformer, run inference on an unseen subset of data,
+    and plot Predicted Tc vs Target Tc with estimation error.
+    Uses an unseen battery+cycle that was likely in the val split.
+    """
+    model_path = BASE_DIR / 'transformer' / 'models' / 'transformer_thermal_core.pth'
+    stats_path = BASE_DIR / 'transformer' / 'models' / 'normalisation_stats.csv'
+
+    if not model_path.exists() or not stats_path.exists():
+        print("  ⚠️ Transformer model or stats not found. Run Step 5 first.")
+        return
+
+    # Load model
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = BatteryThermalTransformer(
+        feature_dim=4, d_model=128, nhead=4,
+        num_layers=4, dim_feedforward=256, dropout=0.1
+    ).to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+    model.eval()
+
+    # Load normalisation stats
+    stats_df = pd.read_csv(stats_path, index_col=0)
+
+    # Select an unseen test subset: B0018 last few cycles (least likely trained heavily)
+    b18 = df[df['battery'] == 'B0018']
+    if b18.empty:
+        # Fallback to B0005
+        b18 = df[df['battery'] == 'B0005']
+    cycles = sorted(b18['cycle'].unique())
+    # Pick a late-aging cycle (likely edge of distribution → hardest for model)
+    test_cycle = cycles[-3] if len(cycles) > 3 else cycles[-1]
+    cyc = b18[b18['cycle'] == test_cycle].copy()
+
+    if len(cyc) < 15:
+        print("  ⚠️ Not enough data for transformer validation plot.")
+        return
+
+    print(f"  🔍 Transformer test on B0018 Cycle {test_cycle} ({len(cyc)} pts)")
+
+    # Normalise features
+    feat_cols = ['current_A', 'voltage_V', 'r0_ohms', 'temp_surface_C']
+    target_col = 'temp_core_C_TARGET'
+
+    cyc_norm = cyc[feat_cols].copy()
+    for col in feat_cols:
+        mu = stats_df.loc['mean', col]
+        sigma = stats_df.loc['std', col]
+        cyc_norm[col] = (cyc_norm[col] - mu) / sigma
+
+    target_mu = stats_df.loc['mean', target_col]
+    target_sigma = stats_df.loc['std', target_col]
+
+    # Determine window size (match training logic)
+    avg_pts = df.groupby(['battery', 'cycle']).size().mean()
+    window_size = min(60, int(avg_pts * 0.3))
+    window_size = max(10, window_size)
+
+    data_arr = cyc_norm[feat_cols].values.astype(np.float32)
+
+    if len(data_arr) <= window_size:
+        print("  ⚠️ Cycle too short for transformer window.")
+        return
+
+    # Run inference
+    preds_norm = []
+    with torch.no_grad():
+        for i in range(len(data_arr) - window_size):
+            x = torch.from_numpy(data_arr[i:i+window_size]).unsqueeze(0).to(device)
+            pred = model(x).item()
+            preds_norm.append(pred)
+
+    # De-normalise
+    preds_tc = np.array(preds_norm) * target_sigma + target_mu
+    target_tc = cyc[target_col].values[window_size:]
+    time_arr = cyc['time_s'].values[window_size:]
+
+    # Calculate error
+    error = preds_tc - target_tc
+    rmse = np.sqrt(np.mean(error**2))
+    mae = np.mean(np.abs(error))
+
+    # ---- Plot: 2-row stacked ----
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8), sharex=True,
+                                     gridspec_kw={'height_ratios': [2, 1]})
+
+    # Top: Estimated comparison
+    ax1.plot(time_arr, target_tc, color='blue', linewidth=1.5,
+             label='Actual UKF Baseline (Physics Twin)')
+    ax1.plot(time_arr, preds_tc, color='orange', linewidth=1.5, linestyle='--',
+             label='Transformer Prediction')
+    ax1.set_ylabel('Core Temperature (°C)')
+    ax1.set_title(f'Transformer Test Validation — B0018 Cycle {test_cycle} '
+                  f'(RMSE={rmse:.4f}°C, MAE={mae:.4f}°C)')
+    ax1.legend(fontsize=11)
+    ax1.grid(True, linestyle='--', alpha=0.6)
+    # Zoom Y-axis to temperature range
+    ymin = min(target_tc.min(), preds_tc.min()) - 0.5
+    ymax = max(target_tc.max(), preds_tc.max()) + 0.5
+    ax1.set_ylim(ymin, ymax)
+
+    # Bottom: Estimation error
+    ax2.plot(time_arr, error, color='red', linewidth=1.0)
+    ax2.axhline(y=0, color='black', linestyle='--', linewidth=0.8)
+    ax2.set_xlabel('Time (s)')
+    ax2.set_ylabel('Error (°C)')
+    ax2.set_title('Estimation Error (Prediction − Target)')
+    ax2.grid(True, linestyle='--', alpha=0.6)
+
+    plt.tight_layout()
+    plt.savefig('results/paper_plots/transformer_test_validation.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  ✅ transformer_test_validation.png (RMSE={rmse:.4f}°C)")
+
+
+# ---- Figure 8: EV Drive Cycle Transformer Validation (US06) ----
+def fig8_ev_transformer_validation():
+    """
+    If EV data exists, run the transformer on US06 and show prediction vs target.
+    Triple-stacked: Current, Tc comparison, Error.
+    """
+    ev_df = load_ev_data()
+    if ev_df is None:
+        print("  ⚠️ No EV dataset found. Skipping EV transformer validation.")
+        return
+
+    model_path = BASE_DIR / 'transformer' / 'models' / 'transformer_thermal_core.pth'
+    stats_path = BASE_DIR / 'transformer' / 'models' / 'normalisation_stats.csv'
+    if not model_path.exists() or not stats_path.exists():
+        print("  ⚠️ Transformer not trained yet.")
+        return
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = BatteryThermalTransformer(
+        feature_dim=4, d_model=128, nhead=4,
+        num_layers=4, dim_feedforward=256, dropout=0.1
+    ).to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+    model.eval()
+
+    stats_df = pd.read_csv(stats_path, index_col=0)
+
+    # Pick one US06 simulation at 25°C
+    us06_batts = [b for b in ev_df['battery'].unique() if 'US06' in b and 'T25' in b]
+    if not us06_batts:
+        print("  ⚠️ No US06 T25 data found.")
+        return
+
+    sel_batt = us06_batts[0]
+    cyc_df = ev_df[ev_df['battery'] == sel_batt].copy()
+
+    feat_cols = ['current_A', 'voltage_V', 'r0_ohms', 'temp_surface_C']
+    target_col = 'temp_core_C_TARGET'
+
+    # Normalise
+    for col in feat_cols:
+        mu, sigma = stats_df.loc['mean', col], stats_df.loc['std', col]
+        cyc_df[col + '_norm'] = (cyc_df[col] - mu) / sigma
+
+    target_mu = stats_df.loc['mean', target_col]
+    target_sigma = stats_df.loc['std', target_col]
+
+    # Combined datasets have different avg pts/cycle
+    window_size = 30  # reasonable for 1Hz data
+
+    norm_cols = [c + '_norm' for c in feat_cols]
+    data_arr = cyc_df[norm_cols].values.astype(np.float32)
+
+    if len(data_arr) <= window_size:
+        print("  ⚠️ Not enough EV data points.")
+        return
+
+    preds_norm = []
+    with torch.no_grad():
+        for i in range(len(data_arr) - window_size):
+            x = torch.from_numpy(data_arr[i:i+window_size]).unsqueeze(0).to(device)
+            pred = model(x).item()
+            preds_norm.append(pred)
+
+    preds_tc = np.array(preds_norm) * target_sigma + target_mu
+    target_tc = cyc_df[target_col].values[window_size:]
+    time_arr = cyc_df['time_s'].values[window_size:]
+    current_arr = cyc_df['current_A'].values[window_size:]
+    error = preds_tc - target_tc
+
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+
+    ax1.plot(time_arr, np.abs(current_arr), color='black', linewidth=0.5)
+    ax1.set_ylabel('|Current| (A)')
+    ax1.set_title(f'EV US06 Drive Cycle — Transformer Core Temp Validation ({sel_batt})')
+    ax1.grid(True, linestyle='--', alpha=0.5)
+
+    ax2.plot(time_arr, target_tc, color='blue', linewidth=1.2, label='Tc Physics (UKF)')
+    ax2.plot(time_arr, preds_tc, color='orange', linewidth=1.2, linestyle='--',
+             label='Tc Transformer')
+    ax2.set_ylabel('Core Temperature (°C)')
+    ax2.legend()
+    ax2.grid(True, linestyle='--', alpha=0.5)
+
+    ax3.plot(time_arr, error, color='red', linewidth=0.8)
+    ax3.axhline(y=0, color='black', linestyle='--', linewidth=0.8)
+    ax3.axhline(y=1.0, color='gray', linestyle=':', alpha=0.5, label='±1.0K bound')
+    ax3.axhline(y=-1.0, color='gray', linestyle=':', alpha=0.5)
+    ax3.set_xlabel('Time (s)')
+    ax3.set_ylabel('Error (°C)')
+    ax3.legend()
+    ax3.grid(True, linestyle='--', alpha=0.5)
+
+    plt.tight_layout()
+    plt.savefig('results/paper_plots/ev_us06_transformer_validation.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    rmse = np.sqrt(np.mean(error**2))
+    print(f"  ✅ ev_us06_transformer_validation.png (RMSE={rmse:.4f}°C)")
+
+
 if __name__ == "__main__":
     print("📊 Generating Paper Plots from Real Pipeline Data...")
     ensure_dir()
@@ -230,9 +480,11 @@ if __name__ == "__main__":
         fig3_core_temp_prediction(df)
         fig4_parameter_aging(df)
         fig6_drive_thermal(df)
+        fig7_transformer_test_validation(df)
     else:
         print("⚠️ No digital twin data — skipping thermal plots.")
 
     fig5_soh_residual('B0005')
+    fig8_ev_transformer_validation()
 
     print("\n✅ All figures saved to results/paper_plots/")

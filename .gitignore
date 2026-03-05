@@ -1,6 +1,7 @@
 # Python
 data/nasa/
 data/digital_twin_sets/
+data/ev_validation_sets/
 __pycache__/
 *.py[cod]
 *$py.class

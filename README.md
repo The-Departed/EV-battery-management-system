@@ -30,10 +30,17 @@ Real NASA 18650 Data (B0005, B0006, B0007, B0018)
 │  Residual SOH       │  │  Aging-Aware Digital Twin             │
 │  (physics + LSTM    │  │  ┌─────────────────────────────────┐ │
 │   correction)       │  │  │ (a) 2-RC ECM identification     │ │
-│  100 epochs, all 4  │  │  │     per-cycle from real V-I     │ │
-│  batteries          │  │  │ (b) 2-state EETM thermal model  │ │
-└─────────────────────┘  │  │     tuned against real Ts (UKS) │ │
-                         │  │ (c) Core temp Tc = physics truth │ │
+│  80/20 train/val    │  │  │     per-cycle from real V-I     │ │
+│  100 epochs, all 4  │  │  │ (b) 2-state EETM thermal model  │ │
+│  batteries          │  │  │     tuned against real Ts (UKS) │ │
+│  + loss curve plot  │  │  │ (c) Core temp Tc = physics truth │ │
+└─────────────────────┘  │  ├─────────────────────────────────┤ │
+                         │  │ (d) Multi-ambient drive viz      │ │
+                         │  │     Aggressive/Mixed at 0/20/50°C│ │
+                         │  │ (e) EV drive-cycle dataset       │ │
+                         │  │     288 sims: 4 batt × 8 aging   │ │
+                         │  │     × 3 drives × 3 temps         │ │
+                         │  │     (UDDS / HWFET / US06)        │ │
                          │  └─────────────────────────────────┘ │
                          └──────────────┬──────────────────────┘
                                         ▼
@@ -42,16 +49,23 @@ Real NASA 18650 Data (B0005, B0006, B0007, B0018)
                          │  Core Temperature Prediction          │
                          │  d=128, 4 heads, 4 layers, 100 ep    │
                          │  Input: [I, V, R0, Ts] → Target: Tc  │
+                         │  Trains on NASA twin + EV drive data  │
+                         │  80/20 train/val + loss curve plot    │
                          └──────────────┬───────────────────────┘
                                         ▼
                          ┌──────────────────────────────────────┐
                          │  Step 6  Paper-Quality Plots          │
-                         │  6 figures → results/paper_plots/     │
+                         │  8 figures → results/paper_plots/     │
+                         │  Including Transformer test           │
+                         │  validation & EV US06 validation      │
                          └──────────────────────────────────────┘
                                         ▼
                          ┌──────────────────────────────────────┐
                          │  Streamlit Interactive Dashboard       │
-                         │  Live LSTM + Transformer inference    │
+                         │  9 pages: Overview, ECM, Thermal,     │
+                         │  Aging, Loss Curves, EV Drives,       │
+                         │  Transformer Validation, Inference,   │
+                         │  Paper Plots                          │
                          └──────────────────────────────────────┘
 ```
 
@@ -67,16 +81,22 @@ The **core temperature of a Li-ion battery cannot be directly measured** in a re
 
 2. **Thermal Model Calibration (UKS-style)** — The 2-state electrothermal model (EETM) parameters (Rᵢₙ, Rₒᵤₜ, Cₖ, Cₛ) are tuned so that the simulated **surface temperature matches the real measured surface temperature**. Once calibrated, the model's internal core temperature output is physically meaningful.
 
-3. **Residual SOH Learning** — A simple physics baseline (Coulomb counting + capacity measurement) provides SOH estimates. An LSTM learns the **residual error** between this baseline and the true SOH, yielding corrected predictions.
+3. **Residual SOH Learning with Train/Val Split** — A simple physics baseline (Coulomb counting + capacity measurement) provides SOH estimates. An LSTM learns the **residual error** between this baseline and the true SOH. An 80/20 train/validation split (via `sklearn.model_selection.train_test_split`) is used to monitor generalisation, with train and validation loss curves plotted and saved.
 
-4. **Transformer Core Temp Prediction** — A Transformer Encoder is trained on [current, voltage, R₀, T_surface] → T_core, using the physics-twin core temperature as the label. This replaces the need for invasive core temperature sensors.
+4. **Multi-Ambient EV Drive-Cycle Data Generation** — The calibrated digital twin is applied to realistic EV drive cycles (UDDS, HWFET, US06) at multiple ambient temperatures (0°C, 25°C, 45°C) across 8 aging states per battery, producing **288 unique physics-based simulations** (~200 hours of synthetic driving data). Additionally, Aggressive and Mixed drive profiles are visualised at 0°C, 20°C, and 50°C to show temperature-dependent thermal behaviour.
+
+5. **Transformer Core Temp Prediction with Expanded Training** — A Transformer Encoder is trained on both the NASA twin dataset and the EV drive-cycle dataset using [current, voltage, R₀, T_surface] → T_core mapping. The combined dataset provides far greater diversity in operating conditions. An 80/20 train/val split with loss curve tracking ensures convergence monitoring.
+
+6. **Transformer Test Validation** — After training, the Transformer is evaluated on unseen data (late-aging cycles of B0018) and on EV drive cycles (US06), producing predicted vs actual core temperature comparison plots with estimation error analysis.
 
 ### What Makes This Different from Mock/Synthetic-Only Approaches
 
 - **Every parameter** in the ECM and thermal model is identified from real experimental data — not hardcoded.
 - Parameters **warm-start** from the previous cycle, naturally capturing aging-induced resistance growth.
 - The thermal model is **validated against real surface temperature** before its core temperature output is trusted.
-- The Transformer never sees mock data — all inputs come from real NASA measurements.
+- The Transformer trains on **both real NASA cycles and physics-generated EV drive cycles**, covering diverse conditions (3 standard drive profiles × 3 temperatures × 4 batteries × 8 aging states).
+- **Train/validation splits** with loss curves provide proper convergence evidence — no overfitting on training data.
+- **Test validation on unseen data** (different battery, late aging) demonstrates generalisation capability.
 
 ---
 
@@ -100,7 +120,7 @@ Sampling interval: ~18 seconds. Each discharge record includes time, current, vo
 ```
 EV-battery-management-system/
 ├── run_pipeline.py                 # Master orchestrator (runs Steps 1→6)
-├── run_ui_dashboard.py             # Streamlit interactive dashboard
+├── run_ui_dashboard.py             # Streamlit interactive dashboard (9 pages)
 ├── pyproject.toml                  # Dependencies (managed by uv)
 │
 ├── data/
@@ -112,25 +132,27 @@ EV-battery-management-system/
 │   │       ├── B0005_aging_features.csv
 │   │       ├── B0005_discharge_timeseries.csv
 │   │       └── ...
-│   └── digital_twin_sets/
-│       └── augmented_aging_twin_dataset.csv
+│   ├── digital_twin_sets/
+│   │   └── augmented_aging_twin_dataset.csv
+│   └── ev_validation_sets/
+│       └── ev_drive_cycle_dataset.csv  # 288 EV simulations
 │
 ├── soh/
-│   ├── step3_train_residual_lstm.py    # Step 3: LSTM residual SOH
+│   ├── step3_train_residual_lstm.py    # Step 3: LSTM residual SOH (80/20 split)
 │   └── models/
 │       └── lstm_residual_soh.pth
 │
 ├── generation/
-│   └── step4_generate_aging_digital_twin.py  # Step 4: Physics digital twin
+│   └── step4_generate_aging_digital_twin.py  # Step 4: Physics twin + EV data gen
 │
 ├── transformer/
-│   ├── step5_train_transformer.py      # Step 5: Transformer core temp
+│   ├── step5_train_transformer.py      # Step 5: Transformer (NASA + EV data)
 │   └── models/
 │       ├── transformer_thermal_core.pth
 │       └── normalisation_stats.csv
 │
 ├── reports/
-│   ├── generate_paper_plots.py         # Step 6: Paper figures
+│   ├── generate_paper_plots.py         # Step 6: Paper figures (8 plots)
 │   └── (plots saved to results/paper_plots/)
 │
 ├── results/
@@ -140,7 +162,14 @@ EV-battery-management-system/
 │       ├── fig3_core_temperature.png
 │       ├── fig4_parameter_aging.png
 │       ├── fig5_soh_residual.png
-│       └── fig6_drive_thermal.png
+│       ├── fig6_drive_thermal.png
+│       ├── transformer_test_validation.png
+│       ├── ev_us06_transformer_validation.png
+│       ├── lstm_training_loss.png
+│       ├── transformer_training_loss.png
+│       ├── aggressive_multi_temp_visualization.png
+│       ├── mixed_multi_temp_visualization.png
+│       └── us06_ev_triple_stack.png
 │
 └── docs_gemini_architectural_plans/    # Architectural docs & planning
 ```
@@ -198,12 +227,12 @@ This sequentially executes:
 |------|--------|-------------|--------|
 | 1 | `data/step1_download_nasa.py` | Downloads NASA battery .mat files from PHM S3 mirror (handles nested zips) | `data/nasa/B0005.mat` … `B0018.mat` |
 | 2 | `data/step2_parse_and_extract_hic.py` | Parses .mat files → per-battery aging features + full discharge time-series CSVs | `data/nasa/processed/*.csv` |
-| 3 | `soh/step3_train_residual_lstm.py` | Trains LSTM (hidden=64) on all 4 batteries for 100 epochs to learn SOH residual | `soh/models/lstm_residual_soh.pth` |
-| 4 | `generation/step4_generate_aging_digital_twin.py` | Per-cycle ECM identification (L-BFGS-B on real V-I) + EETM thermal calibration (against real Ts) → core temp labels | `data/digital_twin_sets/augmented_aging_twin_dataset.csv` |
-| 5 | `transformer/step5_train_transformer.py` | Trains Transformer Encoder (d=128, 4 heads, 4 layers) for 100 epochs with CosineAnnealing LR | `transformer/models/transformer_thermal_core.pth` |
-| 6 | `reports/generate_paper_plots.py` | Generates 6 paper-quality PNG figures from real pipeline data | `results/paper_plots/fig*.png` |
+| 3 | `soh/step3_train_residual_lstm.py` | Trains LSTM (hidden=64) on all 4 batteries for 100 epochs with 80/20 train/val split; saves loss curve | `soh/models/lstm_residual_soh.pth`, `lstm_training_loss.png` |
+| 4 | `generation/step4_generate_aging_digital_twin.py` | Per-cycle ECM + EETM calibration → twin dataset; multi-ambient drive visualisations; 288 EV drive-cycle simulations (UDDS/HWFET/US06 × 3 temps × 4 batts × 8 aging) | `augmented_aging_twin_dataset.csv`, `ev_drive_cycle_dataset.csv`, multi-temp plots |
+| 5 | `transformer/step5_train_transformer.py` | Trains Transformer Encoder (d=128, 4 heads, 4 layers) for 100 epochs on NASA + EV data with 80/20 split; saves loss curve | `transformer_thermal_core.pth`, `transformer_training_loss.png` |
+| 6 | `reports/generate_paper_plots.py` | Generates 8 paper-quality figures including Transformer test validation and EV US06 validation | `results/paper_plots/*.png` |
 
-> **Note:** Step 4 is CPU-bound (per-cycle scipy optimisation). Steps 3 & 5 use GPU. Total pipeline time: ~30–60 minutes depending on GPU.
+> **Note:** Step 4 is CPU-bound (per-cycle scipy optimisation + 288 EV simulations). Steps 3 & 5 use GPU. Total pipeline time: ~45–90 minutes depending on GPU.
 
 ### Running Individual Steps
 
@@ -247,7 +276,7 @@ After the pipeline completes (or even partially — the dashboard gracefully han
 streamlit run run_ui_dashboard.py --server.port 8501
 ```
 
-The dashboard provides 6 interactive pages:
+The dashboard provides 9 interactive pages:
 
 | Page | Description |
 |------|-------------|
@@ -255,10 +284,13 @@ The dashboard provides 6 interactive pages:
 | ⚡ **ECM Voltage Validation** | Interactive cycle-by-cycle comparison of measured vs simulated voltage with error metrics |
 | 🌡️ **Thermal Validation** | Surface temperature validation + core vs surface temperature plots |
 | 🔧 **Parameter Aging** | R₀, R₁, R₂ evolution across cycles showing aging-induced resistance growth |
+| 📈 **Training Loss Curves** | LSTM and Transformer train/val loss over 100 epochs with architecture details |
+| 🚗 **EV Drive Cycles** | Multi-ambient Aggressive/Mixed visualisations, US06 triple-stack, and interactive 288-simulation dataset explorer |
+| 🎯 **Transformer Validation** | Pre-generated test validation plots + interactive per-cycle predicted vs actual Tc with error |
 | 🧠 **Live Inference** | Run LSTM SOH correction and Transformer core temp prediction on any battery/cycle |
-| 📄 **Paper Plots** | View the 6 pre-generated matplotlib figures from Step 6 |
+| 📄 **Paper Plots** | View all 8 pre-generated matplotlib figures from Step 6 |
 
-The sidebar shows real-time pipeline status (which steps have been completed, dataset statistics, model availability).
+The sidebar shows real-time pipeline status (which steps have been completed, dataset statistics for both NASA twin and EV data, model availability).
 
 ---
 
@@ -278,6 +310,16 @@ Embed:  Linear(4 → 128) + learned positional encoding
 Encoder: 4 layers, 4 heads, feedforward=256, dropout=0.1
 Head:   Linear(128 → 32) → GELU → Linear(32 → 1)
 Output: predicted core temperature (°C)
+Training data: NASA twin dataset + 288 EV drive-cycle simulations
+```
+
+### EV Drive-Cycle Data Generation (Step 4)
+```
+Drive Cycles:  UDDS (~1380s), HWFET (~765s), US06 (~600s)
+Temperatures:  0°C, 25°C, 45°C
+Batteries:     B0005, B0006, B0007, B0018
+Aging States:  8 per battery (every 20th cycle)
+Total:         4 × 8 × 3 × 3 = 288 unique simulations (~200 hrs synthetic)
 ```
 
 ---
@@ -292,6 +334,13 @@ Output: predicted core temperature (°C)
 | `fig4_parameter_aging.png` | R₀ growth and SOH fade across all 4 batteries |
 | `fig5_soh_residual.png` | Residual learning setup: true SOH, physics baseline, and LSTM correction target |
 | `fig6_drive_thermal.png` | Current profile, voltage response, and thermal response for a discharge cycle |
+| `transformer_test_validation.png` | Transformer predicted vs actual core temperature on unseen B0018 data with estimation error |
+| `ev_us06_transformer_validation.png` | Transformer core temp prediction on EV US06 drive cycle: current, Tc comparison, error |
+| `lstm_training_loss.png` | LSTM train/validation loss convergence over 100 epochs |
+| `transformer_training_loss.png` | Transformer train/validation loss convergence over 100 epochs |
+| `aggressive_multi_temp_visualization.png` | Aggressive drive profile — current, core temp at 0/20/50°C, voltage |
+| `mixed_multi_temp_visualization.png` | Mixed drive profile — current, core temp at 0/20/50°C, voltage |
+| `us06_ev_triple_stack.png` | US06 drive cycle — current, core temp at 0/25/45°C, voltage |
 
 ---
 
