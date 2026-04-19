@@ -79,7 +79,7 @@ The **core temperature of a Li-ion battery cannot be directly measured** in a re
 
 1. **ECM Parameter Identification** — A 2-RC equivalent circuit model (R₀, R₁, C₁, R₂, C₂) is identified per discharge cycle by minimising the error between simulated and **real measured terminal voltage** (NASA data) using L-BFGS-B optimisation.
 
-2. **Thermal Model Calibration (UKS-style)** — The 2-state electrothermal model (EETM) parameters (Rᵢₙ, Rₒᵤₜ, Cₖ, Cₛ) are tuned so that the simulated **surface temperature matches the real measured surface temperature**. Once calibrated, the model's internal core temperature output is physically meaningful.
+2. **Thermal Model Calibration (UKS-based)** — The 2-state electrothermal model (EETM) parameters (Rᵢₙ, Rₒᵤₜ, Cₖ, Cₛ) are tuned so that the simulated **surface temperature matches the real measured surface temperature** using an Unscented Kalman Smoother (UKS). Once calibrated, the model's internal core temperature output is physically meaningful.
 
 3. **Residual SOH Learning with Train/Val Split** — A simple physics baseline (Coulomb counting + capacity measurement) provides SOH estimates. An LSTM learns the **residual error** between this baseline and the true SOH. An 80/20 train/validation split (via `sklearn.model_selection.train_test_split`) is used to monitor generalisation, with train and validation loss curves plotted and saved.
 

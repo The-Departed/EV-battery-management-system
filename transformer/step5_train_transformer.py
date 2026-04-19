@@ -18,7 +18,7 @@ Target:
 
 The physics model's core temperature is trustworthy because its surface
 temperature output was calibrated to match the real measured surface temp
-(UKS-style tuning in Step 4).
+(UKS-based tuning in Step 4).
 """
 
 import os

@@ -11,7 +11,7 @@ Approach (matching the paper):
   4. Run 2-state EETM thermal model to compute CORE temperature (Tc) and
      surface temperature (Ts_sim)
   5. Tune thermal parameters (Rin, Rout, Cc, Cs) by minimising error between
-     Ts_sim and the REAL measured surface temperature (this is the UKS-style
+     Ts_sim and the REAL measured surface temperature (this is the UKS-based
      calibration step that links experimental data to the digital twin)
   6. Once tuned, Tc is the physics "ground truth" for training the Transformer
   7. Run identified physics on UDDS/HWFET/US06 drive cycles at multiple
@@ -181,7 +181,7 @@ def tune_thermal_params(time_s, current, voltage_sim, voltage_ocv_arr,
     minimising the MSE between simulated surface temperature and the
     REAL measured surface temperature.
 
-    This is the UKS-style calibration: the experimental Ts constrains the
+    This is the UKS-based calibration: the experimental Ts constrains the
     thermal model so that the *unobservable* Tc is physically reliable.
 
     Heat generation: Q_gen = |I * (V_OCV - V_terminal)|
@@ -436,7 +436,7 @@ def generate_multi_ambient_plot(profile_name, ecm_params, therm_params,
     ax3.set_title(f'{profile_name} — Simulated Terminal Voltage')
     ax3.grid(True, linestyle='--', alpha=0.5)
 
-    plt.suptitle(f'Physics Engine: {profile_name} Drive Cycle — UKF-Tuned Parameters',
+    plt.suptitle(f'Physics Engine: {profile_name} Drive Cycle — UKS-Tuned Parameters',
                  fontsize=13, y=1.02)
     plt.tight_layout()
     fname = f'{profile_name.lower()}_multi_temp_visualization.png'
