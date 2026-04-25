@@ -1,52 +1,73 @@
+"""
+run_pipeline.py — Master execution script for the corrected battery digital twin.
+Runs all steps in the correct order:
+  1. Download NASA data
+  2. Download EPA drive cycles
+  3. Parse NASA data (with linear-fade SOH baseline)
+  4. Generate digital twin (ECM + EETM, extracts OCV, saves ECM params)
+  5. Train SOH residual LSTM (uses ECM-identified R₀)
+  6. Train Transformer for core temperature (window_size=1, aligned sampling)
+  7. Generate paper plots
+"""
+
 import subprocess
 import sys
 import os
 from pathlib import Path
 
-# Force all child processes to use GPU 1
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-
-def run_script(script_path):
-    print(f"\n{'-'*60}")
-    print(f"🚀 EXECUTING: {script_path}")
-    print(f"{'-'*60}")
+def run_script(script_path, step_name):
+    print(f"\n{'='*60}")
+    print(f"🚀 STEP: {step_name}")
+    print(f"{'='*60}")
     
-    # Run the script and stream the output directly to the console
+    # Ensure we use the Python executable from the current environment
+    python_exe = sys.executable
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = "1"
-    result = subprocess.run([sys.executable, script_path], cwd=Path(__file__).parent, env=env)
+    env["CUDA_VISIBLE_DEVICES"] = "1"  # force GPU 1 if available
+    
+    result = subprocess.run(
+        [python_exe, script_path],
+        cwd=Path(__file__).parent,
+        env=env,
+        capture_output=False  # stream output directly to console
+    )
     
     if result.returncode != 0:
-        print(f"\n❌ ERROR: Script {script_path} crashed or failed.")
-        print("🛑 PIPELINE HALTED.")
+        print(f"\n❌ ERROR: Step '{step_name}' failed with return code {result.returncode}.")
+        print("   Pipeline halted. Check the error messages above.")
         sys.exit(1)
-        
-    print(f"✅ SUCCESS: {script_path} completed.\n")
+    
+    print(f"✅ STEP COMPLETE: {step_name}\n")
 
 if __name__ == "__main__":
-    print("========================================================")
-    print("🔋 GRAND UNIFIED BATTERY PIPELINE: MASTER EXECUTION RUN 🔋")
-    print("========================================================")
-    
-    # The exact sequential order of the pipeline
-    pipeline_scripts = [
-        "data/step1_download_nasa.py",
-        "data/step2_parse_and_extract_hic.py",
-        "soh/step3_train_residual_lstm.py",
-        "generation/step4_generate_aging_digital_twin.py",
-        "transformer/step5_train_transformer.py",
-        "reports/generate_paper_plots.py"
+    print("=" * 60)
+    print("🔋 CORRECTED BATTERY DIGITAL TWIN — FULL PIPELINE RUN")
+    print("=" * 60)
+
+    # Define steps in the CORRECT order
+    steps = [
+        ("data/step1_download_nasa.py", "Download NASA Battery Data"),
+        ("data/step0_download_epa_drive_cycles.py", "Download EPA Drive Cycles"),
+        ("data/step2_parse_and_extract_hic.py", "Parse NASA Data (Linear SOH Baseline)"),
+        ("generation/step4_generate_aging_digital_twin.py", "Generate Digital Twin (ECM + EETM + OCV Extraction)"),
+        ("soh/step3_train_residual_lstm.py", "Train SOH Residual LSTM (with ECM R₀)"),
+        ("transformer/step5_train_transformer.py", "Train Core Temperature Transformer"),
+        ("reports/generate_paper_plots.py", "Generate Paper Plots"),
     ]
-    
-    for script in pipeline_scripts:
-        if not os.path.exists(script):
-            print(f"❌ ERROR: Cannot find {script}. Make sure you are in the root directory.")
+
+    for script_path, step_name in steps:
+        if not Path(script_path).exists():
+            print(f"❌ ERROR: Script '{script_path}' not found.")
+            print("   Make sure you are in the project root directory.")
             sys.exit(1)
-        run_script(script)
-        
-    print("\n========================================================")
-    print("🎉 PIPELINE COMPLETE! ALL AI MODELS SUCCESSFULLY TRAINED! 🎉")
-    print("========================================================")
-    print("👉 NEXT STEP: Launch the UI by running this command in your terminal:")
-    print("             streamlit run run_ui_dashboard.py")
-    print("========================================================")
+        run_script(script_path, step_name)
+
+    print("\n" + "=" * 60)
+    print("🎉 PIPELINE COMPLETE — ALL AI MODELS TRAINED")
+    print("=" * 60)
+    print("📊 Check results/paper_plots/ for figures.")
+    print("📊 Check soh/models/ and transformer/models/ for trained models.")
+    print("📊 Check data/digital_twin_sets/validation_log.csv for quality metrics.")
+    print("\n👉 To launch the dashboard:")
+    print("   streamlit run run_ui_dashboard.py")
+    print("=" * 60)
