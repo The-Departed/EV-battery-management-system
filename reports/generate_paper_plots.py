@@ -94,8 +94,13 @@ def interpolate_cycle(df_cycle):
     new_data = {'time_s': t_new}
     for col in df.columns:
         if col != 'time_s':
-            f = interp1d(t_old, df[col].values, kind='linear', fill_value='extrapolate')
-            new_data[col] = f(t_new)
+            # Skip non-numeric columns (like 'battery', 'cycle', etc.)
+            if pd.api.types.is_numeric_dtype(df[col]):
+                f = interp1d(t_old, df[col].values, kind='linear', fill_value='extrapolate')
+                new_data[col] = f(t_new)
+            else:
+                # For non-numeric columns, just take the first value (they should be constant)
+                new_data[col] = df[col].iloc[0]
     return pd.DataFrame(new_data)
 
 
