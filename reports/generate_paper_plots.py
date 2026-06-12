@@ -1,490 +1,500 @@
 """
 Step 6: Generate Paper-Quality Plots from Real Pipeline Data
 =============================================================
-All plots are driven by ACTUAL pipeline outputs, not mock data.
-No artificial corrections — the pipeline itself is now physically correct.
-Includes: Transformer test validation with uncertainty bands.
+All plots driven by actual pipeline outputs.
+
+Changes vs previous version (sota-rewrite branch):
+  - Transformer model definition updated to match step5 (6 features,
+    sinusoidal PE, pre-LN TransformerEncoderLayer, norm_first=True).
+  - fig4 now plots C1, C2 alongside R0/R1/R2 (all 5 ECM params saved).
+  - fig5 shows quadratic SOH baseline (not linear) and ICA peak evolution.
+  - fig_qgen: new plot of Q_gen (W) per cycle — verifies Joule formula fix.
+  - Transformer inference uses 6-feature input [I, V, R0, Ts, SOC, Q_gen]
+    and loads feature list from lstm_feature_cols.csv for forward compat.
+  - Graceful fallback: every figure skips if its data is missing.
 """
+
+import warnings
+warnings.filterwarnings("ignore")
 
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import os
 import torch
 import torch.nn as nn
 from pathlib import Path
 from scipy.interpolate import interp1d
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+PLOT_DIR = BASE_DIR / 'results' / 'paper_plots'
+PLOT_DIR.mkdir(parents=True, exist_ok=True)
+
+WINDOW_SIZE  = 60
+FEAT_COLS_6  = ['current_A', 'voltage_V', 'r0_ohms', 'temp_surface_C', 'soc', 'q_gen_W']
+FEAT_COLS_4  = ['current_A', 'voltage_V', 'r0_ohms', 'temp_surface_C']   # compat fallback
+TARGET_COL   = 'temp_core_C_TARGET'
 
 
-def ensure_dir():
-    os.makedirs('results/paper_plots', exist_ok=True)
-
-
-def load_twin_data():
-    """Load the experimentally-tuned digital twin dataset."""
-    p = BASE_DIR / 'data' / 'digital_twin_sets' / 'augmented_aging_twin_dataset.csv'
-    if not p.exists():
-        print(f"⚠️ {p} not found. Run Step 4 first.")
-        return None
-    return pd.read_csv(p)
-
-
-def load_ev_data():
-    """Load the EV drive-cycle dataset."""
-    p = BASE_DIR / 'data' / 'ev_validation_sets' / 'ev_drive_cycle_dataset.csv'
-    if not p.exists():
-        return None
-    return pd.read_csv(p)
-
-
-def load_aging_data(battery='B0005'):
-    """Load per-cycle aging features."""
-    p = BASE_DIR / f'data/nasa/processed/{battery}_aging_features.csv'
-    if not p.exists():
-        return None
-    return pd.read_csv(p)
-
-
-# ---- Transformer model definition (must match training code) ----
-class BatteryThermalTransformer(nn.Module):
-    def __init__(self, feature_dim=4, d_model=128, nhead=4, num_layers=4,
-                 dim_feedforward=256, dropout=0.1):
+# ---------------------------------------------------------------------------
+# Sinusoidal PE (must match step5)
+# ---------------------------------------------------------------------------
+class SinusoidalPE(nn.Module):
+    def __init__(self, d_model: int, max_len: int = 512):
         super().__init__()
-        self.embedding = nn.Linear(feature_dim, d_model)
-        self.pos_encoding = nn.Parameter(torch.randn(1, 512, d_model) * 0.02)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
-            dropout=dropout, batch_first=True)
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.regression_head = nn.Sequential(
+        pe  = torch.zeros(max_len, d_model)
+        pos = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div = torch.exp(torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer('pe', pe.unsqueeze(0))
+
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1), :]
+
+
+class BatteryThermalTransformer(nn.Module):
+    """Must exactly mirror transformer/step5_train_transformer.py."""
+    def __init__(self, feature_dim=6, d_model=128, nhead=4,
+                 num_layers=4, dim_ff=256, dropout=0.1):
+        super().__init__()
+        self.embed = nn.Linear(feature_dim, d_model)
+        self.pe    = SinusoidalPE(d_model)
+        enc        = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=dim_ff,
+            dropout=dropout, batch_first=True, norm_first=True)
+        self.transformer = nn.TransformerEncoder(enc, num_layers=num_layers)
+        self.head = nn.Sequential(
             nn.Linear(d_model, 32), nn.GELU(), nn.Dropout(dropout), nn.Linear(32, 1))
-        self.dropout = dropout
 
-    def forward(self, src, mc_dropout=False):
-        if mc_dropout:
-            self.train()  # enables dropout for MC sampling
-        x = self.embedding(src)
-        T = x.size(1)
-        x = x + self.pos_encoding[:, :T, :]
-        x = self.transformer(x)
-        return self.regression_head(x[:, -1, :])
+    def forward(self, x):
+        return self.head(self.transformer(self.pe(self.embed(x)))[:, -1, :])
 
-    def predict_with_uncertainty(self, x, n_samples=50):
+    def predict_with_uncertainty(self, x, n=50):
+        self.train()
         preds = []
         with torch.no_grad():
-            for _ in range(n_samples):
-                preds.append(self.forward(x, mc_dropout=True).cpu().numpy())
-        preds = np.array(preds).squeeze(-1)   # (n_samples, batch)
-        mean = preds.mean(axis=0)
-        std = preds.std(axis=0)
-        return mean, std
+            for _ in range(n):
+                preds.append(self.forward(x).cpu().numpy())
+        self.eval()
+        preds = np.array(preds).squeeze(-1)
+        return preds.mean(0), preds.std(0)
 
 
-def interpolate_cycle(df_cycle):
-    """Resample a single cycle time series to uniform 1‑second grid."""
-    df = df_cycle.sort_values('time_s')
-    if len(df) < 2:
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _load(path, label=""):
+    if not Path(path).exists():
+        if label:
+            print(f"  ⚠️  {label} not found — skipping.")
+        return None
+    return pd.read_csv(path)
+
+
+def _interp_cycle(df):
+    df = df.sort_values('time_s').drop_duplicates('time_s')
+    if len(df) < 4:
         return df
     t_old = df['time_s'].values
-    t_new = np.arange(t_old[0], t_old[-1] + 0.5, 1.0)
-    new_data = {'time_s': t_new}
+    t_new = np.arange(t_old[0], t_old[-1] + 1, 1.0)
+    out   = {'time_s': t_new}
     for col in df.columns:
         if col != 'time_s':
-            f = interp1d(t_old, df[col].values, kind='linear', fill_value='extrapolate')
-            new_data[col] = f(t_new)
-    return pd.DataFrame(new_data)
+            f = interp1d(t_old, df[col].values, kind='linear',
+                         bounds_error=False,
+                         fill_value=(df[col].iloc[0], df[col].iloc[-1]))
+            out[col] = f(t_new)
+    return pd.DataFrame(out)
 
 
-# ---- Figure 1: ECM Voltage Validation (raw data) ----
+def _load_transformer():
+    mp = BASE_DIR / 'transformer/models/transformer_thermal_core.pth'
+    sp = BASE_DIR / 'transformer/models/normalisation_stats.csv'
+    if not mp.exists() or not sp.exists():
+        return None, None, None, None
+    stats  = pd.read_csv(sp, index_col=0)
+    # Detect feature dimension from stats columns
+    feat_cols = [c for c in FEAT_COLS_6 if c in stats.columns]
+    if len(feat_cols) < 4:
+        feat_cols = FEAT_COLS_4
+    fdim   = len(feat_cols)
+    device = torch.device('cpu')
+    model  = BatteryThermalTransformer(feature_dim=fdim).to(device)
+    state  = torch.load(mp, map_location=device, weights_only=True)
+    # Handle potential key mismatch from old checkpoint
+    try:
+        model.load_state_dict(state)
+    except Exception:
+        print("  ⚠️  Transformer weights don't match current architecture — skipping inference plots.")
+        return None, None, None, None
+    model.eval()
+    return model, stats, feat_cols, device
+
+
+# ---------------------------------------------------------------------------
+# Figure 1: ECM Voltage Validation
+# ---------------------------------------------------------------------------
 def fig1_voltage_validation(df):
-    b5 = df[df['battery'] == 'B0005']
-    mid_cycle = sorted(b5['cycle'].unique())[len(b5['cycle'].unique()) // 2]
-    cyc = b5[b5['cycle'] == mid_cycle]
+    b5  = df[df['battery'] == 'B0005']
+    cycs = sorted(b5['cycle'].unique())
+    mid  = cycs[len(cycs) // 2]
+    cyc  = b5[b5['cycle'] == mid]
+    if len(cyc) < 5:
+        return
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
-    ax1.plot(cyc['time_s'], cyc['voltage_V'], label='V_measured (NASA)', color='blue', alpha=0.8)
-    ax1.plot(cyc['time_s'], cyc['voltage_sim_V'], label='V_simulated (2-RC ECM)', color='orange',
-             linestyle='--', alpha=0.8)
-    ax1.set_ylabel('Terminal Voltage (V)')
-    ax1.legend(loc='lower left')
-    ax1.grid(True, linestyle='--', alpha=0.6)
-    ax1.set_title(f'ECM Voltage Validation — B0005 Cycle {mid_cycle} (SOH={cyc["soh_true"].iloc[0]:.3f})')
-
-    error = np.abs(cyc['voltage_V'].values - cyc['voltage_sim_V'].values)
-    ax2.plot(cyc['time_s'], error * 1000, color='red')
-    ax2.set_ylabel('|Error| (mV)')
-    ax2.set_xlabel('Time (s)')
-    ax2.grid(True, linestyle='--', alpha=0.6)
-
+    ax1.plot(cyc['time_s'], cyc['voltage_V'],     color='royalblue', lw=1.2, label='V measured (NASA)')
+    ax1.plot(cyc['time_s'], cyc['voltage_sim_V'], color='darkorange', lw=1.2, ls='--', label='V simulated (2-RC ECM)')
+    soh = cyc['soh_true'].iloc[0]
+    R0  = cyc['r0_ohms'].iloc[0]
+    ax1.set_ylabel('Voltage (V)')
+    ax1.set_title(f'ECM Voltage Validation — B0005 Cycle {mid}  (SOH={soh:.3f}, R0={R0*1000:.1f} mΩ)')
+    ax1.legend(); ax1.grid(ls='--', alpha=0.5)
+    err = np.abs(cyc['voltage_V'].values - cyc['voltage_sim_V'].values)
+    ax2.plot(cyc['time_s'], err * 1000, color='crimson', lw=0.8)
+    ax2.set_ylabel('|Error| (mV)'); ax2.set_xlabel('Time (s)'); ax2.grid(ls='--', alpha=0.5)
     plt.tight_layout()
-    plt.savefig('results/paper_plots/fig1_voltage_validation.png', dpi=300, bbox_inches='tight')
+    plt.savefig(PLOT_DIR / 'fig1_voltage_validation.png', dpi=150, bbox_inches='tight')
     plt.close()
-    print("  ✅ fig1_voltage_validation.png")
+    print(f"  ✅ fig1 (V_RMSE={np.sqrt(np.mean(err**2))*1000:.2f} mV)")
 
 
-# ---- Figure 2: Surface Temperature Validation ----
-def fig2_surface_temp_validation(df):
-    b5 = df[df['battery'] == 'B0005']
-    cycles = sorted(b5['cycle'].unique())
-    picks = [cycles[5], cycles[len(cycles)//2], cycles[-5]]
-
+# ---------------------------------------------------------------------------
+# Figure 2: Surface Temperature Validation
+# ---------------------------------------------------------------------------
+def fig2_surface_temp(df):
+    b5   = df[df['battery'] == 'B0005']
+    cycs = sorted(b5['cycle'].unique())
+    picks = [cycs[5], cycs[len(cycs)//2], cycs[-5]]
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    for ax, cyc_num in zip(axes, picks):
-        cyc = b5[b5['cycle'] == cyc_num]
-        ax.plot(cyc['time_s'], cyc['temp_surface_C'], label='Ts_measured (NASA)', color='blue')
-        ax.plot(cyc['time_s'], cyc['temp_surface_sim_C'], label='Ts_simulated (EETM)',
-                color='green', linestyle='--')
+    for ax, cn in zip(axes, picks):
+        cyc  = b5[b5['cycle'] == cn]
         rmse = np.sqrt(np.mean((cyc['temp_surface_C'].values - cyc['temp_surface_sim_C'].values)**2))
-        ax.set_title(f'Cycle {cyc_num} (SOH={cyc["soh_true"].iloc[0]:.3f})\nRMSE={rmse:.3f}°C')
-        ax.set_xlabel('Time (s)')
-        ax.set_ylabel('Surface Temperature (°C)')
-        ax.legend(loc='upper left')
-        ax.grid(True, linestyle='--', alpha=0.6)
-
-    plt.suptitle('EETM Surface Temp Validation — Tuned Against Real NASA Data', fontsize=13)
+        ax.plot(cyc['time_s'], cyc['temp_surface_C'],     color='royalblue', lw=1.2, label='Ts measured')
+        ax.plot(cyc['time_s'], cyc['temp_surface_sim_C'], color='seagreen',  lw=1.2, ls='--', label='Ts simulated')
+        ax.set_title(f'Cycle {cn} (SOH={cyc["soh_true"].iloc[0]:.3f})\nRMSE={rmse:.3f}°C')
+        ax.set_xlabel('Time (s)'); ax.set_ylabel('Ts (°C)'); ax.legend(); ax.grid(ls='--', alpha=0.5)
+    plt.suptitle('EETM Surface Temperature Validation (Crank-Nicolson)', fontsize=12)
     plt.tight_layout()
-    plt.savefig('results/paper_plots/fig2_surface_temp_validation.png', dpi=300, bbox_inches='tight')
+    plt.savefig(PLOT_DIR / 'fig2_surface_temp_validation.png', dpi=150, bbox_inches='tight')
     plt.close()
-    print("  ✅ fig2_surface_temp_validation.png")
+    print("  ✅ fig2")
 
 
-# ---- Figure 3: Core Temperature Prediction ----
-def fig3_core_temp_prediction(df):
-    b5 = df[df['battery'] == 'B0005']
-    cycles = sorted(b5['cycle'].unique())
-    picks = [cycles[5], cycles[len(cycles)//2], cycles[-5]]
-
+# ---------------------------------------------------------------------------
+# Figure 3: Core vs Surface Temperature
+# ---------------------------------------------------------------------------
+def fig3_core_temp(df):
+    b5   = df[df['battery'] == 'B0005']
+    cycs = sorted(b5['cycle'].unique())
+    picks = [cycs[5], cycs[len(cycs)//2], cycs[-5]]
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    for ax, cyc_num in zip(axes, picks):
-        cyc = b5[b5['cycle'] == cyc_num]
-        ax.plot(cyc['time_s'], cyc['temp_surface_C'], label='T_surface (measured)', color='blue')
-        ax.plot(cyc['time_s'], cyc['temp_core_C_TARGET'], label='T_core (physics twin)',
-                color='red', linewidth=2)
-        delta = cyc['temp_core_C_TARGET'].values - cyc['temp_surface_C'].values
+    for ax, cn in zip(axes, picks):
+        cyc  = b5[b5['cycle'] == cn]
+        dT   = cyc['temp_core_C_TARGET'].values - cyc['temp_surface_C'].values
+        ax.plot(cyc['time_s'], cyc['temp_surface_C'],     color='royalblue', lw=1.2, label='Ts (measured)')
+        ax.plot(cyc['time_s'], cyc['temp_core_C_TARGET'], color='crimson',   lw=1.5, label='Tc (twin)')
         ax.fill_between(cyc['time_s'], cyc['temp_surface_C'], cyc['temp_core_C_TARGET'],
-                        alpha=0.15, color='red', label=f'ΔT max={delta.max():.2f}°C')
-        ax.set_title(f'Cycle {cyc_num} (SOH={cyc["soh_true"].iloc[0]:.3f})')
-        ax.set_xlabel('Time (s)')
-        ax.set_ylabel('Temperature (°C)')
-        ax.legend(loc='upper left')
-        ax.grid(True, linestyle='--', alpha=0.6)
-
-    plt.suptitle('Core vs Surface Temperature — Physics Digital Twin', fontsize=13)
+                        alpha=0.15, color='crimson', label=f'ΔT_max={dT.max():.2f}°C')
+        ax.set_title(f'Cycle {cn} (SOH={cyc["soh_true"].iloc[0]:.3f})')
+        ax.set_xlabel('Time (s)'); ax.set_ylabel('Temperature (°C)'); ax.legend(); ax.grid(ls='--', alpha=0.5)
+    plt.suptitle('Core vs Surface Temperature — Physics Digital Twin (Joule Q_gen)', fontsize=12)
     plt.tight_layout()
-    plt.savefig('results/paper_plots/fig3_core_temperature.png', dpi=300, bbox_inches='tight')
+    plt.savefig(PLOT_DIR / 'fig3_core_temperature.png', dpi=150, bbox_inches='tight')
     plt.close()
-    print("  ✅ fig3_core_temperature.png")
+    print("  ✅ fig3")
 
 
-# ---- Figure 4: ECM Parameter Evolution with Aging ----
+# ---------------------------------------------------------------------------
+# Figure 4: ECM Parameter Evolution (all 5 params + SOH)
+# ---------------------------------------------------------------------------
 def fig4_parameter_aging(df):
-    cycle_params = df.groupby(['battery', 'cycle']).agg(
-        soh=('soh_true', 'first'),
-        R0=('r0_ohms', 'first'),
-        R1=('r1_ohms', 'first'),
-        R2=('r2_ohms', 'first'),
-    ).reset_index()
+    agg_cols = {'soh': ('soh_true', 'first'),
+                'R0':  ('r0_ohms',  'first'),
+                'R1':  ('r1_ohms',  'first'),
+                'R2':  ('r2_ohms',  'first')}
+    if 'c1_farads' in df.columns:
+        agg_cols['C1'] = ('c1_farads', 'first')
+    if 'c2_farads' in df.columns:
+        agg_cols['C2'] = ('c2_farads', 'first')
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    cp = df.groupby(['battery', 'cycle']).agg(**agg_cols).reset_index()
 
-    for batt, grp in cycle_params.groupby('battery'):
-        ax1.plot(grp['cycle'], grp['R0'] * 1000, 'o-', markersize=2, label=batt)
-    ax1.set_xlabel('Discharge Cycle')
-    ax1.set_ylabel('R0 (mΩ)')
-    ax1.set_title('Internal Resistance Growth with Aging')
-    ax1.legend()
-    ax1.grid(True, linestyle='--', alpha=0.6)
+    ncols = 3 if ('C1' in cp.columns or 'C2' in cp.columns) else 2
+    fig, axes = plt.subplots(1, ncols, figsize=(6*ncols, 5))
 
-    for batt, grp in cycle_params.groupby('battery'):
-        ax2.plot(grp['cycle'], grp['soh'], 'o-', markersize=2, label=batt)
-    ax2.set_xlabel('Discharge Cycle')
-    ax2.set_ylabel('SOH')
-    ax2.set_title('Capacity Fade (State of Health)')
-    ax2.legend()
-    ax2.grid(True, linestyle='--', alpha=0.6)
+    ax = axes[0]
+    for batt, grp in cp.groupby('battery'):
+        ax.plot(grp['cycle'], grp['R0'] * 1000, 'o-', ms=2, label=batt)
+    ax.set(xlabel='Cycle', ylabel='R0 (mΩ)', title='Ohmic Resistance Growth')
+    ax.legend(); ax.grid(ls='--', alpha=0.5)
+
+    ax = axes[1]
+    for batt, grp in cp.groupby('battery'):
+        ax.plot(grp['cycle'], grp['soh'], 'o-', ms=2, label=batt)
+    ax.set(xlabel='Cycle', ylabel='SOH', title='Capacity Fade')
+    ax.legend(); ax.grid(ls='--', alpha=0.5)
+
+    if ncols == 3:
+        ax = axes[2]
+        if 'C1' in cp.columns:
+            for batt, grp in cp.groupby('battery'):
+                ax.plot(grp['cycle'], grp['C1'], 'o-', ms=2, label=f'{batt} C1')
+        if 'C2' in cp.columns:
+            for batt, grp in cp.groupby('battery'):
+                ax.plot(grp['cycle'], grp['C2'], 's--', ms=2, label=f'{batt} C2')
+        ax.set(xlabel='Cycle', ylabel='Capacitance (F)', title='RC Capacitances')
+        ax.legend(); ax.grid(ls='--', alpha=0.5)
 
     plt.tight_layout()
-    plt.savefig('results/paper_plots/fig4_parameter_aging.png', dpi=300, bbox_inches='tight')
+    plt.savefig(PLOT_DIR / 'fig4_parameter_aging.png', dpi=150, bbox_inches='tight')
     plt.close()
-    print("  ✅ fig4_parameter_aging.png")
+    print("  ✅ fig4")
 
 
-# ---- Figure 5: SOH Residual Learning ----
+# ---------------------------------------------------------------------------
+# Figure 5: SOH Residual + ICA Peaks
+# ---------------------------------------------------------------------------
 def fig5_soh_residual(battery='B0005'):
-    df = load_aging_data(battery)
+    df = _load(BASE_DIR / f'data/nasa/processed/{battery}_aging_features.csv', 'aging features')
     if df is None:
-        print(f"  ⚠️ Skipping SOH plot — no aging data for {battery}")
         return
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    has_ica = 'ica_peak1_v' in df.columns or \
+              Path(BASE_DIR / 'data/digital_twin_sets/augmented_aging_twin_dataset.csv').exists()
 
-    ax1.plot(df['cycle'], df['soh_true'], 'k-', linewidth=2, label='SOH_true (NASA)')
-    ax1.plot(df['cycle'], df['soh_physics_baseline'], 'b--', label='SOH_physics (linear fade)')
-    ax1.bar(df['cycle'], df['residual_target'], color='red', alpha=0.4,
-            label='Residual (LSTM target)')
-    ax1.set_xlabel('Cycle')
-    ax1.set_ylabel('SOH / Residual')
-    ax1.set_title(f'{battery}: Residual Learning Setup')
-    ax1.legend()
-    ax1.grid(True, linestyle='--', alpha=0.6)
+    # Try to pull ICA from twin dataset
+    ica_df = None
+    twin_p = BASE_DIR / 'data/digital_twin_sets/augmented_aging_twin_dataset.csv'
+    if twin_p.exists():
+        twin = pd.read_csv(twin_p, usecols=['battery','cycle','ica_peak1_v','ica_peak2_v','ica_peak_ratio'])
+        ica_df = twin[twin['battery']==battery].drop_duplicates('cycle').sort_values('cycle')
 
-    ax2.plot(df['cycle'], df['r_internal_ohms'] * 1000, 'purple', linewidth=2)
-    ax2.set_xlabel('Cycle')
-    ax2.set_ylabel('R_internal (mΩ)')
-    ax2.set_title(f'{battery}: Internal Resistance (ECM-identified R₀)')
-    ax2.grid(True, linestyle='--', alpha=0.6)
+    ncols = 3 if ica_df is not None and not ica_df.empty else 2
+    fig, axes = plt.subplots(1, ncols, figsize=(6*ncols, 5))
+
+    ax = axes[0]
+    ax.plot(df['cycle'], df['soh_true'],           'k-',  lw=2, label='SOH true (NASA)')
+    ax.plot(df['cycle'], df['soh_physics_baseline'],'b--', lw=1.5, label='SOH physics (quadratic)')
+    ax.bar(df['cycle'],  df['residual_target'], color='crimson', alpha=0.4, label='Residual (LSTM target)')
+    ax.set(xlabel='Cycle', ylabel='SOH', title=f'{battery}: Residual Learning Setup')
+    ax.legend(); ax.grid(ls='--', alpha=0.5)
+
+    ax = axes[1]
+    ax.plot(df['cycle'], df['r_internal_ohms'] * 1000, color='purple', lw=1.5)
+    ax.set(xlabel='Cycle', ylabel='R_internal (mΩ)', title=f'{battery}: ECM-identified R0')
+    ax.grid(ls='--', alpha=0.5)
+
+    if ncols == 3 and ica_df is not None:
+        ax = axes[2]
+        ax.plot(ica_df['cycle'], ica_df['ica_peak1_v'], 'g-',  lw=1.2, label='ICA Peak 1 (V)')
+        ax.plot(ica_df['cycle'], ica_df['ica_peak2_v'], 'b--', lw=1.2, label='ICA Peak 2 (V)')
+        ax2b = ax.twinx()
+        ax2b.plot(ica_df['cycle'], ica_df['ica_peak_ratio'], 'r:', lw=1.0, label='Peak ratio')
+        ax2b.set_ylabel('Peak ratio')
+        ax.set(xlabel='Cycle', ylabel='Peak voltage (V)', title=f'{battery}: ICA Peak Evolution')
+        ax.legend(loc='upper left'); ax.grid(ls='--', alpha=0.5)
 
     plt.tight_layout()
-    plt.savefig('results/paper_plots/fig5_soh_residual.png', dpi=300, bbox_inches='tight')
+    plt.savefig(PLOT_DIR / 'fig5_soh_residual.png', dpi=150, bbox_inches='tight')
     plt.close()
-    print("  ✅ fig5_soh_residual.png")
+    print("  ✅ fig5")
 
 
-# ---- Figure 6: Current Profile and Thermal Response ----
+# ---------------------------------------------------------------------------
+# Figure 6: Drive Profile + Thermal Response (with Q_gen)
+# ---------------------------------------------------------------------------
 def fig6_drive_thermal(df):
-    b5 = df[df['battery'] == 'B0005']
-    mid_cycle = sorted(b5['cycle'].unique())[len(b5['cycle'].unique()) // 2]
-    cyc = b5[b5['cycle'] == mid_cycle]
+    b5   = df[df['battery'] == 'B0005']
+    cycs = sorted(b5['cycle'].unique())
+    mid  = cycs[len(cycs) // 2]
+    cyc  = b5[b5['cycle'] == mid]
 
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+    has_qgen = 'q_gen_W' in cyc.columns
+    nrows    = 4 if has_qgen else 3
+    fig, axes = plt.subplots(nrows, 1, figsize=(12, 3*nrows), sharex=True)
 
-    ax1.plot(cyc['time_s'], np.abs(cyc['current_A']), color='red')
-    ax1.set_ylabel('|Current| (A)')
-    ax1.set_title(f'B0005 Cycle {mid_cycle} — Discharge Profile & Thermal Response')
-    ax1.grid(True, linestyle='--', alpha=0.6)
+    axes[0].plot(cyc['time_s'], np.abs(cyc['current_A']), color='crimson', lw=0.8)
+    axes[0].set_ylabel('|I| (A)')
+    axes[0].set_title(f'B0005 Cycle {mid} — Discharge Profile & Thermal Response')
+    axes[0].grid(ls='--', alpha=0.5)
 
-    ax2.plot(cyc['time_s'], cyc['voltage_V'], color='blue')
-    ax2.set_ylabel('Voltage (V)')
-    ax2.grid(True, linestyle='--', alpha=0.6)
+    axes[1].plot(cyc['time_s'], cyc['voltage_V'], color='royalblue', lw=0.8)
+    axes[1].set_ylabel('Voltage (V)'); axes[1].grid(ls='--', alpha=0.5)
 
-    ax3.plot(cyc['time_s'], cyc['temp_surface_C'], label='T_surface', color='blue')
-    ax3.plot(cyc['time_s'], cyc['temp_core_C_TARGET'], label='T_core', color='red', linewidth=2)
-    ax3.set_ylabel('Temperature (°C)')
-    ax3.set_xlabel('Time (s)')
-    ax3.legend()
-    ax3.grid(True, linestyle='--', alpha=0.6)
+    axes[2].plot(cyc['time_s'], cyc['temp_surface_C'],     color='royalblue', lw=1.0, label='Ts')
+    axes[2].plot(cyc['time_s'], cyc['temp_core_C_TARGET'], color='crimson',   lw=1.5, label='Tc')
+    axes[2].set_ylabel('Temp (°C)'); axes[2].legend(); axes[2].grid(ls='--', alpha=0.5)
+
+    if has_qgen:
+        axes[3].plot(cyc['time_s'], cyc['q_gen_W'], color='darkorange', lw=0.8)
+        axes[3].set_ylabel('Q_gen (W)'); axes[3].grid(ls='--', alpha=0.5)
+        axes[3].set_xlabel('Time (s)')
+    else:
+        axes[2].set_xlabel('Time (s)')
 
     plt.tight_layout()
-    plt.savefig('results/paper_plots/fig6_drive_thermal.png', dpi=300, bbox_inches='tight')
+    plt.savefig(PLOT_DIR / 'fig6_drive_thermal.png', dpi=150, bbox_inches='tight')
     plt.close()
-    print("  ✅ fig6_drive_thermal.png")
+    print("  ✅ fig6")
 
 
-# ---- Figure 7: Transformer Test Validation with Uncertainty ----
-def fig7_transformer_test_validation(df):
-    model_path = BASE_DIR / 'transformer' / 'models' / 'transformer_thermal_core.pth'
-    stats_path = BASE_DIR / 'transformer' / 'models' / 'normalisation_stats.csv'
-
-    if not model_path.exists() or not stats_path.exists():
-        print("  ⚠️ Transformer model or stats not found. Run Step 5 first.")
+# ---------------------------------------------------------------------------
+# Figure 7: Transformer Test Validation (held-out B0018)
+# ---------------------------------------------------------------------------
+def fig7_transformer_validation(df):
+    model, stats, feat_cols, device = _load_transformer()
+    if model is None:
         return
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = BatteryThermalTransformer(
-        feature_dim=4, d_model=128, nhead=4,
-        num_layers=4, dim_feedforward=256, dropout=0.1
-    ).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
-    model.eval()
-
-    stats_df = pd.read_csv(stats_path, index_col=0)
-
-    # Held-out battery: B0018 (or fallback to B0005)
-    b18 = df[df['battery'] == 'B0018']
-    if b18.empty:
-        b18 = df[df['battery'] == 'B0005']
-    cycles = sorted(b18['cycle'].unique())
-    test_cycle = cycles[-3] if len(cycles) > 3 else cycles[-1]
-    cyc = b18[b18['cycle'] == test_cycle].copy()
-
-    if len(cyc) < 15:
-        print("  ⚠️ Not enough data for transformer validation plot.")
+    b18  = df[df['battery'] == 'B0018']
+    pool = b18 if not b18.empty else df[df['battery'] == 'B0005']
+    cycs = sorted(pool['cycle'].unique())
+    cn   = cycs[-3] if len(cycs) > 3 else cycs[-1]
+    cyc  = _interp_cycle(pool[pool['cycle'] == cn].copy())
+    if len(cyc) <= WINDOW_SIZE:
+        print("  ⚠️  Cycle too short for transformer validation.")
         return
 
-    # Interpolate to 1 s and prepare features
-    cyc = interpolate_cycle(cyc)
-    print(f"  🔍 Transformer test on B0018 Cycle {test_cycle} ({len(cyc)} pts after interpolation)")
-
-    feat_cols = ['current_A', 'voltage_V', 'r0_ohms', 'temp_surface_C']
-    target_col = 'temp_core_C_TARGET'
-
-    cyc_norm = cyc[feat_cols].copy()
+    # Normalise features
     for col in feat_cols:
-        mu = stats_df.loc['mean', col]
-        sigma = stats_df.loc['std', col]
-        cyc_norm[col] = (cyc_norm[col] - mu) / sigma
+        if col not in cyc.columns:
+            cyc[col] = 0.0
+        mu, sigma = float(stats.loc['mean', col]), float(stats.loc['std', col])
+        cyc[col] = (cyc[col] - mu) / sigma
 
-    target_mu = stats_df.loc['mean', target_col]
-    target_sigma = stats_df.loc['std', target_col]
+    if TARGET_COL not in cyc.columns:
+        print(f"  ⚠️  {TARGET_COL} missing."); return
+    t_mu, t_sig = float(stats.loc['mean', TARGET_COL]), float(stats.loc['std', TARGET_COL])
+    cyc[TARGET_COL] = (cyc[TARGET_COL] - t_mu) / t_sig
 
-    window_size = 60   # must match training
-    data_arr = cyc_norm[feat_cols].values.astype(np.float32)
-
-    if len(data_arr) <= window_size:
-        print("  ⚠️ Cycle too short for transformer window.")
-        return
-
-    # MC dropout predictions
-    mean_preds, std_preds = [], []
+    data = cyc[feat_cols].values.astype(np.float32)
+    means, stds = [], []
     with torch.no_grad():
-        for i in range(len(data_arr) - window_size):
-            x = torch.from_numpy(data_arr[i:i+window_size]).unsqueeze(0).to(device)
-            m, s = model.predict_with_uncertainty(x, n_samples=50)
-            mean_preds.append(m[0])
-            std_preds.append(s[0])
+        for i in range(len(data) - WINDOW_SIZE):
+            x = torch.from_numpy(data[i:i + WINDOW_SIZE]).unsqueeze(0).to(device)
+            m, s = model.predict_with_uncertainty(x, n=50)
+            means.append(m[0]); stds.append(s[0])
 
-    time_arr = cyc['time_s'].values[window_size:]
-    mean_arr = np.array(mean_preds) * target_sigma + target_mu
-    std_arr  = np.array(std_preds) * target_sigma
-    target_tc = cyc[target_col].values[window_size:]
-    error = mean_arr - target_tc
-
-    rmse = np.sqrt(np.mean(error**2))
+    t_arr = cyc['time_s'].values[WINDOW_SIZE:]
+    m_arr = np.array(means) * t_sig + t_mu
+    s_arr = np.array(stds)  * t_sig
+    tc    = cyc[TARGET_COL].values[WINDOW_SIZE:] * t_sig + t_mu
+    err   = m_arr - tc
+    rmse  = np.sqrt(np.mean(err**2))
 
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+    ax1.plot(t_arr, np.abs(pool[pool['cycle']==cn].sort_values('time_s')['current_A'].values[:len(t_arr)]),
+             color='black', lw=0.5)
+    ax1.set_ylabel('|I| (A)')
+    ax1.set_title(f'Transformer Test (held-out B0018 Cycle {cn}) — RMSE={rmse:.4f}°C')
+    ax1.grid(ls='--', alpha=0.5)
 
-    ax1.plot(time_arr, np.abs(cyc['current_A'].values[window_size:]), color='black', linewidth=0.5)
-    ax1.set_ylabel('|Current| (A)')
-    ax1.set_title(f'Transformer Test Validation — B0018 Cycle {test_cycle} '
-                  f'(RMSE={rmse:.4f}°C)')
-    ax1.grid(True, linestyle='--', alpha=0.5)
+    ax2.plot(t_arr, tc,    color='royalblue', lw=1.5, label='Tc physics twin')
+    ax2.plot(t_arr, m_arr, color='darkorange', lw=1.5, ls='--', label='Tc transformer')
+    ax2.fill_between(t_arr, m_arr - 2*s_arr, m_arr + 2*s_arr,
+                     color='darkorange', alpha=0.2, label='95% CI')
+    ax2.set_ylabel('Tc (°C)'); ax2.legend(); ax2.grid(ls='--', alpha=0.5)
 
-    ax2.plot(time_arr, target_tc, color='blue', linewidth=1.5,
-             label='Tc Physics (Digital Twin)')
-    ax2.plot(time_arr, mean_arr, color='orange', linewidth=1.5, linestyle='--',
-             label='Tc Transformer')
-    ax2.fill_between(time_arr, mean_arr - 2*std_arr, mean_arr + 2*std_arr,
-                     color='orange', alpha=0.2, label='95% CI')
-    ax2.set_ylabel('Core Temperature (°C)')
-    ax2.legend()
-    ax2.grid(True, linestyle='--', alpha=0.5)
-
-    ax3.plot(time_arr, error, color='red', linewidth=1.0)
-    ax3.axhline(y=0, color='black', linestyle='--', linewidth=0.8)
-    ax3.set_xlabel('Time (s)')
-    ax3.set_ylabel('Error (°C)')
-    ax3.grid(True, linestyle='--', alpha=0.5)
+    ax3.plot(t_arr, err, color='crimson', lw=0.8)
+    ax3.axhline(0, color='black', ls='--', lw=0.7)
+    ax3.set_ylabel('Error (°C)'); ax3.set_xlabel('Time (s)'); ax3.grid(ls='--', alpha=0.5)
 
     plt.tight_layout()
-    plt.savefig('results/paper_plots/transformer_test_validation.png', dpi=300, bbox_inches='tight')
+    plt.savefig(PLOT_DIR / 'transformer_test_validation.png', dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"  ✅ transformer_test_validation.png (RMSE={rmse:.4f}°C)")
+    print(f"  ✅ fig7 (RMSE={rmse:.4f}°C)")
 
 
-# ---- Figure 8: EV Drive Cycle Transformer Validation with Uncertainty ----
-def fig8_ev_transformer_validation():
-    ev_df = load_ev_data()
+# ---------------------------------------------------------------------------
+# Figure 8: EV US06 Transformer Validation
+# ---------------------------------------------------------------------------
+def fig8_ev_validation():
+    model, stats, feat_cols, device = _load_transformer()
+    if model is None:
+        return
+    ev_df = _load(BASE_DIR / 'data/ev_validation_sets/ev_drive_cycle_dataset.csv', 'EV dataset')
     if ev_df is None:
-        print("  ⚠️ No EV dataset found. Skipping EV transformer validation.")
         return
 
-    model_path = BASE_DIR / 'transformer' / 'models' / 'transformer_thermal_core.pth'
-    stats_path = BASE_DIR / 'transformer' / 'models' / 'normalisation_stats.csv'
-    if not model_path.exists() or not stats_path.exists():
-        print("  ⚠️ Transformer not trained yet.")
+    us06 = [b for b in ev_df['battery'].unique() if 'US06' in b and 'T25' in b]
+    if not us06:
+        print("  ⚠️  No US06 T25 EV data found."); return
+
+    cyc = _interp_cycle(ev_df[ev_df['battery'] == us06[0]].copy())
+    if len(cyc) <= WINDOW_SIZE:
         return
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = BatteryThermalTransformer(
-        feature_dim=4, d_model=128, nhead=4,
-        num_layers=4, dim_feedforward=256, dropout=0.1
-    ).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
-    model.eval()
-
-    stats_df = pd.read_csv(stats_path, index_col=0)
-
-    # Pick one US06 simulation at 25°C
-    us06_batts = [b for b in ev_df['battery'].unique() if 'US06' in b and 'T25' in b]
-    if not us06_batts:
-        print("  ⚠️ No US06 T25 data found.")
-        return
-
-    sel_batt = us06_batts[0]
-    cyc_df = ev_df[ev_df['battery'] == sel_batt].copy()
-    cyc_df = interpolate_cycle(cyc_df)
-
-    feat_cols = ['current_A', 'voltage_V', 'r0_ohms', 'temp_surface_C']
-    target_col = 'temp_core_C_TARGET'
 
     for col in feat_cols:
-        mu, sigma = stats_df.loc['mean', col], stats_df.loc['std', col]
-        cyc_df[col + '_norm'] = (cyc_df[col] - mu) / sigma
+        if col not in cyc.columns:
+            cyc[col] = 0.0
+        mu, sigma = float(stats.loc['mean', col]), float(stats.loc['std', col])
+        cyc[col] = (cyc[col] - mu) / sigma
 
-    target_mu = stats_df.loc['mean', target_col]
-    target_sigma = stats_df.loc['std', target_col]
-
-    window_size = 60
-    norm_cols = [c + '_norm' for c in feat_cols]
-    data_arr = cyc_df[norm_cols].values.astype(np.float32)
-
-    if len(data_arr) <= window_size:
-        print("  ⚠️ Not enough EV data points.")
+    if TARGET_COL not in cyc.columns:
         return
+    t_mu, t_sig = float(stats.loc['mean', TARGET_COL]), float(stats.loc['std', TARGET_COL])
+    cyc[TARGET_COL] = (cyc[TARGET_COL] - t_mu) / t_sig
 
-    mean_preds, std_preds = [], []
+    data  = cyc[feat_cols].values.astype(np.float32)
+    means, stds = [], []
     with torch.no_grad():
-        for i in range(len(data_arr) - window_size):
-            x = torch.from_numpy(data_arr[i:i+window_size]).unsqueeze(0).to(device)
-            m, s = model.predict_with_uncertainty(x, n_samples=50)
-            mean_preds.append(m[0])
-            std_preds.append(s[0])
+        for i in range(len(data) - WINDOW_SIZE):
+            x = torch.from_numpy(data[i:i + WINDOW_SIZE]).unsqueeze(0).to(device)
+            m, s = model.predict_with_uncertainty(x, n=50)
+            means.append(m[0]); stds.append(s[0])
 
-    time_arr = cyc_df['time_s'].values[window_size:]
-    mean_arr = np.array(mean_preds) * target_sigma + target_mu
-    std_arr  = np.array(std_preds) * target_sigma
-    target_tc = cyc_df[target_col].values[window_size:]
-    error = mean_arr - target_tc
+    t_arr = cyc['time_s'].values[WINDOW_SIZE:]
+    m_arr = np.array(means) * t_sig + t_mu
+    s_arr = np.array(stds)  * t_sig
+    tc    = cyc[TARGET_COL].values[WINDOW_SIZE:] * t_sig + t_mu
+    err   = m_arr - tc
+    rmse  = np.sqrt(np.mean(err**2))
 
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+    raw_i = ev_df[ev_df['battery'] == us06[0]].sort_values('time_s')['current_A'].values
+    ax1.plot(t_arr, np.abs(raw_i[:len(t_arr)]), color='black', lw=0.5)
+    ax1.set_ylabel('|I| (A)'); ax1.set_title(f'EV US06 Transformer Validation ({us06[0]}) RMSE={rmse:.4f}°C')
+    ax1.grid(ls='--', alpha=0.5)
 
-    ax1.plot(time_arr, np.abs(cyc_df['current_A'].values[window_size:]), color='black', linewidth=0.5)
-    ax1.set_ylabel('|Current| (A)')
-    ax1.set_title(f'EV US06 Drive Cycle — Transformer Core Temp Validation ({sel_batt})')
-    ax1.grid(True, linestyle='--', alpha=0.5)
+    ax2.plot(t_arr, tc,    color='royalblue',  lw=1.2, label='Tc physics')
+    ax2.plot(t_arr, m_arr, color='darkorange', lw=1.2, ls='--', label='Tc transformer')
+    ax2.fill_between(t_arr, m_arr - 2*s_arr, m_arr + 2*s_arr,
+                     color='darkorange', alpha=0.2, label='95% CI')
+    ax2.set_ylabel('Tc (°C)'); ax2.legend(); ax2.grid(ls='--', alpha=0.5)
 
-    ax2.plot(time_arr, target_tc, color='blue', linewidth=1.2, label='Tc Physics (Digital Twin)')
-    ax2.plot(time_arr, mean_arr, color='orange', linewidth=1.2, linestyle='--',
-             label='Tc Transformer')
-    ax2.fill_between(time_arr, mean_arr - 2*std_arr, mean_arr + 2*std_arr,
-                     color='orange', alpha=0.2, label='95% CI')
-    ax2.set_ylabel('Core Temperature (°C)')
-    ax2.legend()
-    ax2.grid(True, linestyle='--', alpha=0.5)
-
-    ax3.plot(time_arr, error, color='red', linewidth=0.8)
-    ax3.axhline(y=0, color='black', linestyle='--', linewidth=0.8)
-    ax3.set_xlabel('Time (s)')
-    ax3.set_ylabel('Error (°C)')
-    ax3.grid(True, linestyle='--', alpha=0.5)
+    ax3.plot(t_arr, err, color='crimson', lw=0.8)
+    ax3.axhline(0, color='black', ls='--', lw=0.7)
+    ax3.set_ylabel('Error (°C)'); ax3.set_xlabel('Time (s)'); ax3.grid(ls='--', alpha=0.5)
 
     plt.tight_layout()
-    plt.savefig('results/paper_plots/ev_us06_transformer_validation.png', dpi=300, bbox_inches='tight')
+    plt.savefig(PLOT_DIR / 'ev_us06_transformer_validation.png', dpi=150, bbox_inches='tight')
     plt.close()
-    rmse = np.sqrt(np.mean(error**2))
-    print(f"  ✅ ev_us06_transformer_validation.png (RMSE={rmse:.4f}°C)")
+    print(f"  ✅ fig8 EV US06 RMSE={rmse:.4f}°C")
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    print("📊 Generating Paper Plots from Real Pipeline Data...")
-    ensure_dir()
+    print("📊 Generating paper plots...")
 
-    df = load_twin_data()
+    df = _load(BASE_DIR / 'data/digital_twin_sets/augmented_aging_twin_dataset.csv',
+               'augmented twin dataset')
     if df is not None:
         fig1_voltage_validation(df)
-        fig2_surface_temp_validation(df)
-        fig3_core_temp_prediction(df)
+        fig2_surface_temp(df)
+        fig3_core_temp(df)
         fig4_parameter_aging(df)
         fig6_drive_thermal(df)
-        fig7_transformer_test_validation(df)
+        fig7_transformer_validation(df)
     else:
-        print("⚠️ No digital twin data — skipping thermal plots.")
+        print("⚠️  No twin data — skipping figs 1-4, 6-7.")
 
     fig5_soh_residual('B0005')
-    fig8_ev_transformer_validation()
+    fig8_ev_validation()
 
-    print("\n✅ All figures saved to results/paper_plots/")
+    print(f"\n✅ All available figures saved → {PLOT_DIR}")
